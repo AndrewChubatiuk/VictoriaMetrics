@@ -34,6 +34,14 @@ Examples:
 absolute path to all .yaml files in root.
 Rule files may contain %{ENV_VAR} placeholders, which are substituted by the corresponding env vars.`)
 
+	ruleTemplatesPath = flagutil.NewArray("rule.templates", `Path to the file with rule templates.
+Supports patterns. Flag can be specified multiple times.
+Examples:
+ -rule.templates="/path/to/file". Path to a single file with rule templates
+ -rule.templates="dir/*.yaml" -rule="/*.yaml". Relative path to all .yaml files in "dir" folder,
+absolute path to all .yaml files in root.
+Rule files may contain %{ENV_VAR} placeholders, which are substituted by the corresponding env vars.`)
+
 	rulesCheckInterval = flag.Duration("rule.configCheckInterval", 0, "Interval for checking for changes in '-rule' files. "+
 		"By default the checking is disabled. Send SIGHUP signal in order to force config check for changes. DEPRECATED - see '-configCheckInterval' instead")
 
@@ -76,7 +84,11 @@ func main() {
 
 	if *dryRun {
 		u, _ := url.Parse("https://victoriametrics.com/")
-		notifier.InitTemplateFunc(u)
+		funcs := notifier.GetTemplateFunc(u)
+		err := notifier.LoadTemplates(*ruleTemplatesPath, funcs)
+		if err != nil {
+			logger.Fatalf("failed to parse %q: %s", *ruleTemplatesPath, err)
+		}
 		groups, err := config.Parse(*rulePath, true, true)
 		if err != nil {
 			logger.Fatalf("failed to parse %q: %s", *rulePath, err)
@@ -91,7 +103,12 @@ func main() {
 	if err != nil {
 		logger.Fatalf("failed to init `external.url`: %s", err)
 	}
-	notifier.InitTemplateFunc(eu)
+	funcs := notifier.GetTemplateFunc(eu)
+	err = notifier.LoadTemplates(*ruleTemplatesPath, funcs)
+	if err != nil {
+		logger.Fatalf("failed to parse %q: %s", *ruleTemplatesPath, err)
+	}
+
 	alertURLGeneratorFn, err = getAlertURLGenerator(eu, *externalAlertSource, *validateTemplates)
 	if err != nil {
 		logger.Fatalf("failed to init `external.alert.source`: %s", err)
@@ -105,7 +122,11 @@ func main() {
 		if rw == nil {
 			logger.Fatalf("remoteWrite.url can't be empty in replay mode")
 		}
-		notifier.InitTemplateFunc(eu)
+		funcs := notifier.GetTemplateFunc(eu)
+		err = notifier.LoadTemplates(*ruleTemplatesPath, funcs)
+		if err != nil {
+			logger.Fatalf("failed to parse %q: %s", *ruleTemplatesPath, err)
+		}
 		groupsCfg, err := config.Parse(*rulePath, *validateTemplates, *validateExpressions)
 		if err != nil {
 			logger.Fatalf("cannot parse configuration file: %s", err)
@@ -127,7 +148,6 @@ func main() {
 	if err != nil {
 		logger.Fatalf("failed to init: %s", err)
 	}
-
 	logger.Infof("reading rules configuration file from %q", strings.Join(*rulePath, ";"))
 	groupsCfg, err := config.Parse(*rulePath, *validateTemplates, *validateExpressions)
 	if err != nil {

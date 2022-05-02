@@ -60,12 +60,10 @@ func datasourceMetricsToTemplateMetrics(ms []datasource.Metric) []metric {
 // for templating functions.
 type QueryFn func(query string) ([]datasource.Metric, error)
 
-var tmplFunc textTpl.FuncMap
-
-// InitTemplateFunc initiates template helper functions
-func InitTemplateFunc(externalURL *url.URL) {
+// GetTemplateFunc initiates template helper functions
+func GetTemplateFunc(externalURL *url.URL) textTpl.FuncMap {
 	// See https://prometheus.io/docs/prometheus/latest/configuration/template_reference/
-	tmplFunc = textTpl.FuncMap{
+	return textTpl.FuncMap{
 		/* Strings */
 
 		// reReplaceAll ReplaceAllString returns a copy of src, replacing matches of the Regexp with
@@ -316,11 +314,8 @@ func InitTemplateFunc(externalURL *url.URL) {
 	}
 }
 
-func funcsWithQuery(query QueryFn) textTpl.FuncMap {
+func queryFuncs(query QueryFn) textTpl.FuncMap {
 	fm := make(textTpl.FuncMap)
-	for k, fn := range tmplFunc {
-		fm[k] = fn
-	}
 	fm["query"] = func(q string) ([]metric, error) {
 		result, err := query(q)
 		if err != nil {
