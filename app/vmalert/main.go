@@ -39,8 +39,7 @@ Supports patterns. Flag can be specified multiple times.
 Examples:
  -rule.templates="/path/to/file". Path to a single file with rule templates
  -rule.templates="dir/*.yaml" -rule="/*.yaml". Relative path to all .yaml files in "dir" folder,
-absolute path to all .yaml files in root.
-Rule files may contain %{ENV_VAR} placeholders, which are substituted by the corresponding env vars.`)
+absolute path to all .yaml files in root.`)
 
 	rulesCheckInterval = flag.Duration("rule.configCheckInterval", 0, "Interval for checking for changes in '-rule' files. "+
 		"By default the checking is disabled. Send SIGHUP signal in order to force config check for changes. DEPRECATED - see '-configCheckInterval' instead")
