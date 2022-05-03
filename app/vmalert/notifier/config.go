@@ -3,13 +3,14 @@ package notifier
 import (
 	"crypto/md5"
 	"fmt"
-	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"net/url"
 	"path"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v2"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"

@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"path/filepath"
 	"strings"
-	"text/template"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
@@ -87,35 +85,32 @@ var tplHeaders = []string{
 	"{{ $externalURL := .ExternalURL }}",
 }
 
-var masterTmpl *template.Template
-
 // ExecTemplate executes the Alert template for given
 // map of annotations.
 // Every alert could have a different datasource, so function
 // requires a queryFunction as an argument.
 func (a *Alert) ExecTemplate(q QueryFn, labels, annotations map[string]string) (map[string]string, error) {
 	tplData := AlertTplData{Value: a.Value, Labels: labels, Expr: a.Expr}
-	tpl, err := masterTmpl.Clone()
+	tmpl, err := masterTmpl.Clone()
 	if err != nil {
-		return nil, fmt.Errorf("error cloning annotation: %w", err)
+		return nil, fmt.Errorf("error cloning template: %w", err)
 	}
-	tpl = tpl.Funcs(queryFuncs(q))
-	return templateAnnotations(annotations, tplData, tpl)
+	qt := &TextTemplate{tmpl.Funcs(queryFuncs(q))}
+	return templateAnnotations(annotations, tplData, qt, true)
 }
 
 // ExecTemplate executes the given template for given annotations map.
 func ExecTemplate(q QueryFn, annotations map[string]string, tplData AlertTplData) (map[string]string, error) {
-	tpl, err := masterTmpl.Clone()
+	tmpl, err := masterTmpl.Clone()
 	if err != nil {
-		return nil, fmt.Errorf("error cloning annotation: %w", err)
+		return nil, fmt.Errorf("error cloning template: %w", err)
 	}
-	tpl = tpl.Funcs(queryFuncs(q))
-	return templateAnnotations(annotations, tplData, tpl)
+	qt := &TextTemplate{tmpl.Funcs(queryFuncs(q))}
+	return templateAnnotations(annotations, tplData, qt, true)
 }
 
 // ValidateTemplates validate annotations for possible template error, uses empty data for template population
 func ValidateTemplates(annotations map[string]string) error {
-	fmt.Println(masterTmpl.Name())
 	_, err := templateAnnotations(annotations, AlertTplData{
 		Labels: map[string]string{},
 		Value:  0,
@@ -123,28 +118,12 @@ func ValidateTemplates(annotations map[string]string) error {
 	return err
 }
 
-func LoadTemplates(pathPatterns []string, funcs template.FuncMap) error {
-	masterTmpl = template.New("").Funcs(funcs).Option("missingkey=zero")
-	fmt.Println(masterTmpl.Name())
-	for _, tp := range pathPatterns {
-		p, err := filepath.Glob(tp)
-		if err != nil {
-			return fmt.Errorf("failed to retrieve a template glob: %w", err)
-		}
-		if len(p) > 0 {
-			if masterTmpl, err = masterTmpl.ParseGlob(tp); err != nil {
-				return fmt.Errorf("failed to parse template glob: %w", err)
-			}
-		}
-	}
-	return nil
-}
-
-func templateAnnotations(annotations map[string]string, data AlertTplData, tmpl *template.Template) (map[string]string, error) {
+func templateAnnotations(annotations map[string]string, data AlertTplData, tmpl *TextTemplate, execute bool) (map[string]string, error) {
 	var builder strings.Builder
 	var buf bytes.Buffer
 	eg := new(utils.ErrGroup)
 	r := make(map[string]string, len(annotations))
+	tmpl.Funcs(externalUrlFuncs(externalURL))
 	tData := tplData{data, externalLabels, externalURL}
 	header := strings.Join(tplHeaders, "")
 	for key, text := range annotations {
@@ -169,10 +148,14 @@ type tplData struct {
 	ExternalURL    string
 }
 
-func templateAnnotation(dst io.Writer, text string, data tplData, tmpl *template.Template) error {
-	tpl, err := template.Must(tmpl.Clone()).Parse(text)
+func templateAnnotation(dst io.Writer, text string, data tplData, tmpl *TextTemplate, execute bool) error {
+	tpl, err := tmpl.Clone()
 	if err != nil {
-		return fmt.Errorf("error parsing annotation: %w", err)
+		return fmt.Errorf("error cloning template before parse annotation: %w", err)
+	}
+	tpl, err = tpl.Parse(text)
+	if err != nil {
+		return fmt.Errorf("error parsing annotation template: %w", err)
 	}
 	if !execute {
 		return nil

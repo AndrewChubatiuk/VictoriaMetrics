@@ -80,14 +80,13 @@ func main() {
 	envflag.Parse()
 	buildinfo.Init()
 	logger.Init()
+	tmpl, err := notifier.LoadTemplates(*ruleTemplatesPath)
+	if err != nil {
+		logger.Fatalf("failed to parse %q: %s", *ruleTemplatesPath, err)
+	}
+	notifier.SetTemplate(tmpl)
 
 	if *dryRun {
-		u, _ := url.Parse("https://victoriametrics.com/")
-		funcs := notifier.GetTemplateFunc(u)
-		err := notifier.LoadTemplates(*ruleTemplatesPath, funcs)
-		if err != nil {
-			logger.Fatalf("failed to parse %q: %s", *ruleTemplatesPath, err)
-		}
 		groups, err := config.Parse(*rulePath, true, true)
 		if err != nil {
 			logger.Fatalf("failed to parse %q: %s", *rulePath, err)
@@ -102,11 +101,6 @@ func main() {
 	if err != nil {
 		logger.Fatalf("failed to init `external.url`: %s", err)
 	}
-	funcs := notifier.GetTemplateFunc(eu)
-	err = notifier.LoadTemplates(*ruleTemplatesPath, funcs)
-	if err != nil {
-		logger.Fatalf("failed to parse %q: %s", *ruleTemplatesPath, err)
-	}
 
 	alertURLGeneratorFn, err = getAlertURLGenerator(eu, *externalAlertSource, *validateTemplates)
 	if err != nil {
@@ -120,11 +114,6 @@ func main() {
 		}
 		if rw == nil {
 			logger.Fatalf("remoteWrite.url can't be empty in replay mode")
-		}
-		funcs := notifier.GetTemplateFunc(eu)
-		err = notifier.LoadTemplates(*ruleTemplatesPath, funcs)
-		if err != nil {
-			logger.Fatalf("failed to parse %q: %s", *ruleTemplatesPath, err)
 		}
 		groupsCfg, err := config.Parse(*rulePath, *validateTemplates, *validateExpressions)
 		if err != nil {
@@ -300,7 +289,7 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 		case <-ctx.Done():
 			return
 		case <-sighupCh:
-			logger.Infof("SIGHUP received. Going to reload rules %q ...", *rulePath)
+			logger.Infof("SIGHUP received. Going to reload rules %q and templates %q ...", *rulePath, *ruleTemplatesPath)
 			configReloads.Inc()
 		case <-configCheckCh:
 		}
@@ -308,6 +297,13 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 			configReloadErrors.Inc()
 			configSuccess.Set(0)
 			logger.Errorf("failed to reload notifier config: %s", err)
+			continue
+		}
+		newTmpl, err := notifier.LoadTemplates(*ruleTemplatesPath)
+		if err != nil {
+			configReloadErrors.Inc()
+			configSuccess.Set(0)
+			logger.Errorf("failed to parse loaded new templates: %s", err)
 			continue
 		}
 		newGroupsCfg, err := config.Parse(*rulePath, *validateTemplates, *validateExpressions)
@@ -318,11 +314,20 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 			continue
 		}
 		if configsEqual(newGroupsCfg, groupsCfg) {
+			notifier.SetTemplate(newTmpl)
 			// set success to 1 since previous reload
 			// could have been unsuccessful
 			configSuccess.Set(1)
 			// config didn't change - skip it
 			continue
+		}
+		if newTplNames, err := notifier.AddNewTemplates(newTmpl); err != nil {
+			configReloadErrors.Inc()
+			configSuccess.Set(0)
+			logger.Errorf("cannot while adding new templates: %s", err)
+			continue
+		} else {
+			logger.Infof("Added new templates before rules updates: %q", newTplNames)
 		}
 		if err := m.update(ctx, newGroupsCfg, false); err != nil {
 			configReloadErrors.Inc()
@@ -330,6 +335,7 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 			logger.Errorf("error while reloading rules: %s", err)
 			continue
 		}
+		notifier.SetTemplate(newTmpl)
 		groupsCfg = newGroupsCfg
 		configSuccess.Set(1)
 		configTimestamp.Set(fasttime.UnixTimestamp())

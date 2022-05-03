@@ -16,9 +16,11 @@ package notifier
 import (
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"math"
 	"net"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -30,6 +32,66 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
+
+var defaultTemplate = `{{- define "default.template" -}}{{- end -}}`
+
+type TextTemplate struct {
+	*textTpl.Template
+}
+
+var masterTmpl *TextTemplate
+
+func LoadTemplates(pathPatterns []string) (*TextTemplate, error) {
+	tmpl := &TextTemplate{textTpl.New("").Option("missingkey=zero").Funcs(templateFuncs())}
+	tmpl = &TextTemplate{textTpl.Must(tmpl.Parse(defaultTemplate))}
+	for _, tp := range pathPatterns {
+		p, err := filepath.Glob(tp)
+		if err != nil {
+			return nil, fmt.Errorf("failed to retrieve a template glob %q: %w", tp, err)
+		}
+		if len(p) > 0 {
+			newTmpl, err := tmpl.ParseGlob(tp)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse template glob %q: %w", tp, err)
+			}
+			tmpl = &TextTemplate{newTmpl}
+		}
+	}
+	if len(tmpl.Templates()) > 0 {
+		err := tmpl.Execute(ioutil.Discard, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute template: %w", err)
+		}
+	}
+	return tmpl, nil
+}
+
+func AddNewTemplates(tmpl *TextTemplate) ([]string, error) {
+	return masterTmpl.addNewTemplates(tmpl)
+}
+
+func (tp *TextTemplate) addNewTemplates(tmpl *TextTemplate) ([]string, error) {
+	var tmplNames []string
+	for _, t := range tmpl.Templates() {
+		if tp.Lookup(t.Name()) == nil {
+			if txtTpl, err := tp.AddParseTree(t.Name(), t.Tree); err != nil {
+				return nil, fmt.Errorf("failed to add template %q: %w", t.Name(), err)
+			} else {
+				tp = &TextTemplate{txtTpl}
+			}
+			tmplNames = append(tmplNames, t.Name())
+		}
+	}
+	return tmplNames, nil
+}
+
+func SetTemplate(tmpl *TextTemplate) {
+	masterTmpl = tmpl
+}
+
+func (t *TextTemplate) UpdateFuncs(funcMap textTpl.FuncMap) {
+	t = &TextTemplate{t.Funcs(funcMap)}
+}
 
 // metric is private copy of datasource.Metric,
 // it is used for templating annotations,
@@ -60,8 +122,8 @@ func datasourceMetricsToTemplateMetrics(ms []datasource.Metric) []metric {
 // for templating functions.
 type QueryFn func(query string) ([]datasource.Metric, error)
 
-// GetTemplateFunc initiates template helper functions
-func GetTemplateFunc(externalURL *url.URL) textTpl.FuncMap {
+// templateFuncs initiates template helper functions
+func templateFuncs() textTpl.FuncMap {
 	// See https://prometheus.io/docs/prometheus/latest/configuration/template_reference/
 	return textTpl.FuncMap{
 		/* Strings */
@@ -217,12 +279,12 @@ func GetTemplateFunc(externalURL *url.URL) textTpl.FuncMap {
 
 		// externalURL returns value of `external.url` flag
 		"externalURL": func() string {
-			return externalURL.String()
+			return "https://victoriametrics.com/"
 		},
 
 		// pathPrefix returns a Path segment from the URL value in `external.url` flag
 		"pathPrefix": func() string {
-			return externalURL.Path
+			return "/"
 		},
 
 		// pathEscape escapes the string so it can be safely placed inside a URL path segment,
@@ -315,15 +377,28 @@ func GetTemplateFunc(externalURL *url.URL) textTpl.FuncMap {
 }
 
 func queryFuncs(query QueryFn) textTpl.FuncMap {
-	fm := make(textTpl.FuncMap)
-	fm["query"] = func(q string) ([]metric, error) {
-		result, err := query(q)
-		if err != nil {
-			return nil, err
-		}
-		return datasourceMetricsToTemplateMetrics(result), nil
+	return textTpl.FuncMap{
+		"query": func(q string) ([]metric, error) {
+			result, err := query(q)
+			if err != nil {
+				return nil, err
+			}
+			return datasourceMetricsToTemplateMetrics(result), nil
+		},
 	}
-	return fm
+}
+
+func externalUrlFuncs(externalURL string) textTpl.FuncMap {
+	extUrl, _ := url.Parse(externalURL)
+	return textTpl.FuncMap{
+		"externalURL": func() string {
+			return externalURL
+		},
+
+		"pathPrefix": func() string {
+			return extUrl.Path
+		},
+	}
 }
 
 // Time is the number of milliseconds since the epoch
