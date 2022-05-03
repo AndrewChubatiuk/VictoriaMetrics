@@ -1,13 +1,12 @@
 package notifier
 
 import (
-	"net/url"
 	"os"
 	"testing"
 )
 
 func TestMain(m *testing.M) {
-	u, _ := url.Parse("https://victoriametrics.com/path")
-	InitTemplateFunc(u)
+	tmpl, _ := LoadTemplates([]string{"testdata/*good.tmpl"})
+	SetTemplate(tmpl)
 	os.Exit(m.Run())
 }

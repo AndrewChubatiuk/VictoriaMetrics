@@ -74,11 +74,11 @@ func (tp *TextTemplate) addNewTemplates(tmpl *TextTemplate) ([]string, error) {
 	var tmplNames []string
 	for _, t := range tmpl.Templates() {
 		if tp.Lookup(t.Name()) == nil {
-			if txtTpl, err := tp.AddParseTree(t.Name(), t.Tree); err != nil {
+			txtTpl, err := tp.AddParseTree(t.Name(), t.Tree)
+			if err != nil {
 				return nil, fmt.Errorf("failed to add template %q: %w", t.Name(), err)
-			} else {
-				tp = &TextTemplate{txtTpl}
 			}
+			tp = &TextTemplate{txtTpl}
 			tmplNames = append(tmplNames, t.Name())
 		}
 	}
@@ -87,10 +87,6 @@ func (tp *TextTemplate) addNewTemplates(tmpl *TextTemplate) ([]string, error) {
 
 func SetTemplate(tmpl *TextTemplate) {
 	masterTmpl = tmpl
-}
-
-func (t *TextTemplate) UpdateFuncs(funcMap textTpl.FuncMap) {
-	t = &TextTemplate{t.Funcs(funcMap)}
 }
 
 // metric is private copy of datasource.Metric,
@@ -388,15 +384,14 @@ func queryFuncs(query QueryFn) textTpl.FuncMap {
 	}
 }
 
-func externalUrlFuncs(externalURL string) textTpl.FuncMap {
-	extUrl, _ := url.Parse(externalURL)
+func externalURLFuncs(externalURL *url.URL) textTpl.FuncMap {
 	return textTpl.FuncMap{
 		"externalURL": func() string {
-			return externalURL
+			return externalURL.String()
 		},
 
 		"pathPrefix": func() string {
-			return extUrl.Path
+			return externalURL.Path
 		},
 	}
 }

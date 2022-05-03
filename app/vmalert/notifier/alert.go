@@ -123,7 +123,6 @@ func templateAnnotations(annotations map[string]string, data AlertTplData, tmpl 
 	var buf bytes.Buffer
 	eg := new(utils.ErrGroup)
 	r := make(map[string]string, len(annotations))
-	tmpl.Funcs(externalUrlFuncs(externalURL))
 	tData := tplData{data, externalLabels, externalURL}
 	header := strings.Join(tplHeaders, "")
 	for key, text := range annotations {

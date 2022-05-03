@@ -3,6 +3,7 @@ package notifier
 import (
 	"flag"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -83,6 +84,9 @@ func Init(gen AlertURLGenerator, extLabels map[string]string, extURL string) (fu
 
 	externalURL = extURL
 	externalLabels = extLabels
+	eu, _ := url.Parse(externalURL)
+
+	masterTmpl = &TextTemplate{masterTmpl.Funcs(externalURLFuncs(eu))}
 
 	if *configPath == "" && len(*addrs) == 0 {
 		return nil, nil
