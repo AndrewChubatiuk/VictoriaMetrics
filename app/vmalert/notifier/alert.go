@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	textTpl "text/template"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
@@ -91,22 +92,22 @@ var tplHeaders = []string{
 // requires a queryFunction as an argument.
 func (a *Alert) ExecTemplate(q QueryFn, labels, annotations map[string]string) (map[string]string, error) {
 	tplData := AlertTplData{Value: a.Value, Labels: labels, Expr: a.Expr}
-	tmpl, err := masterTmpl.Clone()
+	tmpl, err := masterTmpl.current.Clone()
 	if err != nil {
 		return nil, fmt.Errorf("error cloning template: %w", err)
 	}
-	qt := &TextTemplate{tmpl.Funcs(queryFuncs(q))}
-	return templateAnnotations(annotations, tplData, qt, true)
+	tmpl = tmpl.Funcs(queryFuncs(q))
+	return templateAnnotations(annotations, tplData, tmpl, true)
 }
 
 // ExecTemplate executes the given template for given annotations map.
 func ExecTemplate(q QueryFn, annotations map[string]string, tplData AlertTplData) (map[string]string, error) {
-	tmpl, err := masterTmpl.Clone()
+	tmpl, err := masterTmpl.current.Clone()
 	if err != nil {
 		return nil, fmt.Errorf("error cloning template: %w", err)
 	}
-	qt := &TextTemplate{tmpl.Funcs(queryFuncs(q))}
-	return templateAnnotations(annotations, tplData, qt, true)
+	tmpl = tmpl.Funcs(queryFuncs(q))
+	return templateAnnotations(annotations, tplData, tmpl, true)
 }
 
 // ValidateTemplates validate annotations for possible template error, uses empty data for template population
@@ -114,11 +115,11 @@ func ValidateTemplates(annotations map[string]string) error {
 	_, err := templateAnnotations(annotations, AlertTplData{
 		Labels: map[string]string{},
 		Value:  0,
-	}, masterTmpl)
+	}, masterTmpl.current, false)
 	return err
 }
 
-func templateAnnotations(annotations map[string]string, data AlertTplData, tmpl *TextTemplate, execute bool) (map[string]string, error) {
+func templateAnnotations(annotations map[string]string, data AlertTplData, tmpl *textTpl.Template, execute bool) (map[string]string, error) {
 	var builder strings.Builder
 	var buf bytes.Buffer
 	eg := new(utils.ErrGroup)
@@ -147,7 +148,7 @@ type tplData struct {
 	ExternalURL    string
 }
 
-func templateAnnotation(dst io.Writer, text string, data tplData, tmpl *TextTemplate, execute bool) error {
+func templateAnnotation(dst io.Writer, text string, data tplData, tmpl *textTpl.Template, execute bool) error {
 	tpl, err := tmpl.Clone()
 	if err != nil {
 		return fmt.Errorf("error cloning template before parse annotation: %w", err)

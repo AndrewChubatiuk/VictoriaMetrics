@@ -34,12 +34,12 @@ Examples:
 absolute path to all .yaml files in root.
 Rule files may contain %{ENV_VAR} placeholders, which are substituted by the corresponding env vars.`)
 
-	ruleTemplatesPath = flagutil.NewArray("rule.templates", `Path to the file with rule templates.
-Supports patterns. Flag can be specified multiple times.
+	ruleTemplatesPath = flagutil.NewArray("rule.templates", `Path or glob pattern to location with go template definitions 
+	for rules annotations templating. Flag can be specified multiple times.
 Examples:
- -rule.templates="/path/to/file". Path to a single file with rule templates
- -rule.templates="dir/*.yaml" -rule="/*.yaml". Relative path to all .yaml files in "dir" folder,
-absolute path to all .yaml files in root.`)
+ -rule.templates="/path/to/file". Path to a single file with go templates
+ -rule.templates="dir/*.tpl" -rule.templates="/*.tpl". Relative path to all .tpl files in "dir" folder,
+absolute path to all .tpl files in root.`)
 
 	rulesCheckInterval = flag.Duration("rule.configCheckInterval", 0, "Interval for checking for changes in '-rule' files. "+
 		"By default the checking is disabled. Send SIGHUP signal in order to force config check for changes. DEPRECATED - see '-configCheckInterval' instead")
@@ -80,11 +80,10 @@ func main() {
 	envflag.Parse()
 	buildinfo.Init()
 	logger.Init()
-	tmpl, err := notifier.LoadTemplates(*ruleTemplatesPath)
+	err := notifier.LoadTemplates(*ruleTemplatesPath, true)
 	if err != nil {
 		logger.Fatalf("failed to parse %q: %s", *ruleTemplatesPath, err)
 	}
-	notifier.SetTemplate(tmpl)
 
 	if *dryRun {
 		groups, err := config.Parse(*rulePath, true, true)
@@ -299,11 +298,11 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 			logger.Errorf("failed to reload notifier config: %s", err)
 			continue
 		}
-		newTmpl, err := notifier.LoadTemplates(*ruleTemplatesPath)
+		err := notifier.LoadTemplates(*ruleTemplatesPath, false)
 		if err != nil {
 			configReloadErrors.Inc()
 			configSuccess.Set(0)
-			logger.Errorf("failed to parse loaded new templates: %s", err)
+			logger.Errorf("failed to load new templates: %s", err)
 			continue
 		}
 		newGroupsCfg, err := config.Parse(*rulePath, *validateTemplates, *validateExpressions)
@@ -314,20 +313,17 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 			continue
 		}
 		if configsEqual(newGroupsCfg, groupsCfg) {
-			notifier.SetTemplate(newTmpl)
+			if err = notifier.ReplaceTemplates(); err != nil {
+				configReloadErrors.Inc()
+				configSuccess.Set(0)
+				logger.Errorf("cannot replace templates: %s", err)
+				continue
+			}
 			// set success to 1 since previous reload
 			// could have been unsuccessful
 			configSuccess.Set(1)
 			// config didn't change - skip it
 			continue
-		}
-		if newTplNames, err := notifier.AddNewTemplates(newTmpl); err != nil {
-			configReloadErrors.Inc()
-			configSuccess.Set(0)
-			logger.Errorf("cannot while adding new templates: %s", err)
-			continue
-		} else {
-			logger.Infof("Added new templates before rules updates: %q", newTplNames)
 		}
 		if err := m.update(ctx, newGroupsCfg, false); err != nil {
 			configReloadErrors.Inc()
@@ -335,7 +331,12 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 			logger.Errorf("error while reloading rules: %s", err)
 			continue
 		}
-		notifier.SetTemplate(newTmpl)
+		if err = notifier.ReplaceTemplates(); err != nil {
+			configReloadErrors.Inc()
+			configSuccess.Set(0)
+			logger.Errorf("cannot replace templates: %s", err)
+			continue
+		}
 		groupsCfg = newGroupsCfg
 		configSuccess.Set(1)
 		configTimestamp.Set(fasttime.UnixTimestamp())

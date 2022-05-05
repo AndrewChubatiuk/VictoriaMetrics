@@ -6,7 +6,6 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	tmpl, _ := LoadTemplates([]string{"testdata/*good.tmpl"})
-	SetTemplate(tmpl)
+	LoadTemplates([]string{"testdata/templates/*good.tmpl"}, true)
 	os.Exit(m.Run())
 }

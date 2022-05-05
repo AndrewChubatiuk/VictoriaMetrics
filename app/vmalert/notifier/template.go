@@ -33,60 +33,65 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
-var defaultTemplate = `{{- define "default.template" -}}{{- end -}}`
+// go template execution fails when it's tree is empty
+const defaultTemplate = `{{- define "default.template" -}}{{- end -}}`
 
-type TextTemplate struct {
-	*textTpl.Template
+type textTemplate struct {
+	current     *textTpl.Template
+	replacement *textTpl.Template
 }
 
-var masterTmpl *TextTemplate
+var masterTmpl textTemplate
 
-func LoadTemplates(pathPatterns []string) (*TextTemplate, error) {
-	tmpl := &TextTemplate{textTpl.New("").Option("missingkey=zero").Funcs(templateFuncs())}
-	tmpl = &TextTemplate{textTpl.Must(tmpl.Parse(defaultTemplate))}
+// loads templates from multiple globs specified in pathPatterns and either
+// sets them directly to current template if it's undefined or with overwrite=true
+// or sets replacement templates and adds templates with new names to a current
+func LoadTemplates(pathPatterns []string, overwrite bool) error {
+	var err error
+	tmpl := textTpl.New("").Option("missingkey=zero").Funcs(templateFuncs())
+	tmpl = textTpl.Must(tmpl.Parse(defaultTemplate))
 	for _, tp := range pathPatterns {
 		p, err := filepath.Glob(tp)
 		if err != nil {
-			return nil, fmt.Errorf("failed to retrieve a template glob %q: %w", tp, err)
+			return fmt.Errorf("failed to retrieve a template glob %q: %w", tp, err)
 		}
 		if len(p) > 0 {
-			newTmpl, err := tmpl.ParseGlob(tp)
+			tmpl, err = tmpl.ParseGlob(tp)
 			if err != nil {
-				return nil, fmt.Errorf("failed to parse template glob %q: %w", tp, err)
+				return fmt.Errorf("failed to parse template glob %q: %w", tp, err)
 			}
-			tmpl = &TextTemplate{newTmpl}
 		}
 	}
 	if len(tmpl.Templates()) > 0 {
 		err := tmpl.Execute(ioutil.Discard, nil)
 		if err != nil {
-			return nil, fmt.Errorf("failed to execute template: %w", err)
+			return fmt.Errorf("failed to execute template: %w", err)
 		}
 	}
-	return tmpl, nil
-}
-
-func AddNewTemplates(tmpl *TextTemplate) ([]string, error) {
-	return masterTmpl.addNewTemplates(tmpl)
-}
-
-func (tp *TextTemplate) addNewTemplates(tmpl *TextTemplate) ([]string, error) {
-	var tmplNames []string
-	for _, t := range tmpl.Templates() {
-		if tp.Lookup(t.Name()) == nil {
-			txtTpl, err := tp.AddParseTree(t.Name(), t.Tree)
+	if masterTmpl.current == nil || overwrite {
+		masterTmpl.current = tmpl
+		return nil
+	}
+	if masterTmpl.replacement, err = tmpl.Clone(); err != nil {
+		return nil
+	}
+	for _, tp := range masterTmpl.replacement.Templates() {
+		if masterTmpl.current.Lookup(tp.Name()) == nil {
+			masterTmpl.current, err = masterTmpl.current.AddParseTree(tp.Name(), tp.Tree)
 			if err != nil {
-				return nil, fmt.Errorf("failed to add template %q: %w", t.Name(), err)
+				return fmt.Errorf("failed to add template %q: %w", tp.Name(), err)
 			}
-			tp = &TextTemplate{txtTpl}
-			tmplNames = append(tmplNames, t.Name())
 		}
 	}
-	return tmplNames, nil
+	return nil
 }
 
-func SetTemplate(tmpl *TextTemplate) {
-	masterTmpl = tmpl
+// replaces current template with a replacement template
+// which was set by LoadTemplates with override=false
+func ReplaceTemplates() error {
+	var err error
+	masterTmpl.current, err = masterTmpl.replacement.Clone()
+	return err
 }
 
 // metric is private copy of datasource.Metric,

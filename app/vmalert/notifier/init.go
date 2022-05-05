@@ -86,7 +86,7 @@ func Init(gen AlertURLGenerator, extLabels map[string]string, extURL string) (fu
 	externalLabels = extLabels
 	eu, _ := url.Parse(externalURL)
 
-	masterTmpl = &TextTemplate{masterTmpl.Funcs(externalURLFuncs(eu))}
+	masterTmpl.current = masterTmpl.current.Funcs(externalURLFuncs(eu))
 
 	if *configPath == "" && len(*addrs) == 0 {
 		return nil, nil

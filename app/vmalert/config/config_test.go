@@ -15,8 +15,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	tmpl, _ := notifier.LoadTemplates([]string{"testdata/*good.tmpl"})
-	notifier.SetTemplate(tmpl)
+	notifier.LoadTemplates([]string{"testdata/templates/*good.tmpl"}, true)
 	os.Exit(m.Run())
 }
 
