@@ -84,7 +84,10 @@ func Init(gen AlertURLGenerator, extLabels map[string]string, extURL string) (fu
 
 	externalURL = extURL
 	externalLabels = extLabels
-	eu, _ := url.Parse(externalURL)
+	eu, err := url.Parse(externalURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse external URL: %s", err)
+	}
 
 	masterTmpl.current = masterTmpl.current.Funcs(externalURLFuncs(eu))
 

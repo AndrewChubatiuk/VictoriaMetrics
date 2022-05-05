@@ -288,7 +288,11 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 		case <-ctx.Done():
 			return
 		case <-sighupCh:
-			logger.Infof("SIGHUP received. Going to reload rules %q and templates %q ...", *rulePath, *ruleTemplatesPath)
+			tmplMsg := ""
+			if len(*ruleTemplatesPath) > 0 {
+				tmplMsg = fmt.Sprintf("and templates %q ", *ruleTemplatesPath)
+			}
+			logger.Infof("SIGHUP received. Going to reload rules %q %s...", *rulePath, tmplMsg)
 			configReloads.Inc()
 		case <-configCheckCh:
 		}

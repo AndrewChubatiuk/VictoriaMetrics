@@ -280,12 +280,12 @@ func templateFuncs() textTpl.FuncMap {
 
 		// externalURL returns value of `external.url` flag
 		"externalURL": func() string {
-			return "https://victoriametrics.com/"
+			return ""
 		},
 
 		// pathPrefix returns a Path segment from the URL value in `external.url` flag
 		"pathPrefix": func() string {
-			return "/"
+			return ""
 		},
 
 		// pathEscape escapes the string so it can be safely placed inside a URL path segment,
