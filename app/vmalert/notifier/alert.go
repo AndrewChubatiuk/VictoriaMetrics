@@ -8,6 +8,7 @@ import (
 	textTpl "text/template"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/templates"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
@@ -90,32 +91,34 @@ var tplHeaders = []string{
 // map of annotations.
 // Every alert could have a different datasource, so function
 // requires a queryFunction as an argument.
-func (a *Alert) ExecTemplate(q QueryFn, labels, annotations map[string]string) (map[string]string, error) {
+func (a *Alert) ExecTemplate(q templates.QueryFn, labels, annotations map[string]string) (map[string]string, error) {
 	tplData := AlertTplData{Value: a.Value, Labels: labels, Expr: a.Expr}
-	tmpl, err := masterTmpl.current.Clone()
+	tmpl, err := templates.GetWithFuncs(templates.FuncsWithQuery(q))
 	if err != nil {
-		return nil, fmt.Errorf("error cloning template: %w", err)
+		return nil, fmt.Errorf("error getting a template: %w", err)
 	}
-	tmpl = tmpl.Funcs(queryFuncs(q))
 	return templateAnnotations(annotations, tplData, tmpl, true)
 }
 
 // ExecTemplate executes the given template for given annotations map.
-func ExecTemplate(q QueryFn, annotations map[string]string, tplData AlertTplData) (map[string]string, error) {
-	tmpl, err := masterTmpl.current.Clone()
+func ExecTemplate(q templates.QueryFn, annotations map[string]string, tplData AlertTplData) (map[string]string, error) {
+	tmpl, err := templates.GetWithFuncs(templates.FuncsWithQuery(q))
 	if err != nil {
 		return nil, fmt.Errorf("error cloning template: %w", err)
 	}
-	tmpl = tmpl.Funcs(queryFuncs(q))
 	return templateAnnotations(annotations, tplData, tmpl, true)
 }
 
 // ValidateTemplates validate annotations for possible template error, uses empty data for template population
 func ValidateTemplates(annotations map[string]string) error {
-	_, err := templateAnnotations(annotations, AlertTplData{
+	tmpl, err := templates.Get()
+	if err != nil {
+		return err
+	}
+	_, err = templateAnnotations(annotations, AlertTplData{
 		Labels: map[string]string{},
 		Value:  0,
-	}, masterTmpl.current, false)
+	}, tmpl, false)
 	return err
 }
 

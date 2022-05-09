@@ -13,10 +13,13 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/remotewrite"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/templates"
 )
 
 func TestMain(m *testing.M) {
-	notifier.LoadTemplates([]string{"testdata/templates/*good.tmpl"}, true)
+	if err := templates.Load([]string{"testdata/templates/*good.tmpl"}, true); err != nil {
+		os.Exit(1)
+	}
 	os.Exit(m.Run())
 }
 

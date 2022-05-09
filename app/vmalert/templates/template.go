@@ -11,11 +11,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package notifier
+package templates
 
 import (
 	"errors"
 	"fmt"
+	htmlTpl "html/template"
 	"io/ioutil"
 	"math"
 	"net"
@@ -24,9 +25,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
-	htmlTpl "html/template"
 	textTpl "text/template"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
@@ -37,16 +38,17 @@ import (
 const defaultTemplate = `{{- define "default.template" -}}{{- end -}}`
 
 type textTemplate struct {
+	tplMu       sync.RWMutex
 	current     *textTpl.Template
 	replacement *textTpl.Template
 }
 
 var masterTmpl textTemplate
 
-// loads templates from multiple globs specified in pathPatterns and either
+// Load func loads templates from multiple globs specified in pathPatterns and either
 // sets them directly to current template if it's undefined or with overwrite=true
 // or sets replacement templates and adds templates with new names to a current
-func LoadTemplates(pathPatterns []string, overwrite bool) error {
+func Load(pathPatterns []string, overwrite bool) error {
 	var err error
 	tmpl := textTpl.New("").Option("missingkey=zero").Funcs(templateFuncs())
 	tmpl = textTpl.Must(tmpl.Parse(defaultTemplate))
@@ -68,7 +70,10 @@ func LoadTemplates(pathPatterns []string, overwrite bool) error {
 			return fmt.Errorf("failed to execute template: %w", err)
 		}
 	}
+	masterTmpl.tplMu.Lock()
+	defer masterTmpl.tplMu.Unlock()
 	if masterTmpl.current == nil || overwrite {
+		masterTmpl.replacement = nil
 		masterTmpl.current = tmpl
 		return nil
 	}
@@ -86,11 +91,15 @@ func LoadTemplates(pathPatterns []string, overwrite bool) error {
 	return nil
 }
 
-// replaces current template with a replacement template
-// which was set by LoadTemplates with override=false
-func ReplaceTemplates() error {
+// Reload func replaces current template with a replacement template
+// which was set by Load with override=false
+func Reload() error {
 	var err error
-	masterTmpl.current, err = masterTmpl.replacement.Clone()
+	masterTmpl.tplMu.Lock()
+	defer masterTmpl.tplMu.Unlock()
+	if masterTmpl.replacement != nil {
+		masterTmpl.current, err = masterTmpl.replacement.Clone()
+	}
 	return err
 }
 
@@ -122,6 +131,58 @@ func datasourceMetricsToTemplateMetrics(ms []datasource.Metric) []metric {
 // QueryFn is used to wrap a call to datasource into simple-to-use function
 // for templating functions.
 type QueryFn func(query string) ([]datasource.Metric, error)
+
+// UpdateWithFuncs updates existing or sets a new function map for a template
+func UpdateWithFuncs(funcs textTpl.FuncMap) {
+	masterTmpl.tplMu.Lock()
+	defer masterTmpl.tplMu.Unlock()
+	masterTmpl.current = masterTmpl.current.Funcs(funcs)
+}
+
+// GetWithFuncs returns a copy of current template with additional FuncMap
+// provided with funcs argument
+func GetWithFuncs(funcs textTpl.FuncMap) (*textTpl.Template, error) {
+	masterTmpl.tplMu.RLock()
+	tmpl, err := masterTmpl.current.Clone()
+	if err != nil {
+		return nil, err
+	}
+	masterTmpl.tplMu.RUnlock()
+	return tmpl.Funcs(funcs), nil
+}
+
+// Get returns a copy of a template
+func Get() (*textTpl.Template, error) {
+	masterTmpl.tplMu.RLock()
+	defer masterTmpl.tplMu.RUnlock()
+	return masterTmpl.current.Clone()
+}
+
+// FuncsWithQuery returns a function map that depends on metric data
+func FuncsWithQuery(query QueryFn) textTpl.FuncMap {
+	return textTpl.FuncMap{
+		"query": func(q string) ([]metric, error) {
+			result, err := query(q)
+			if err != nil {
+				return nil, err
+			}
+			return datasourceMetricsToTemplateMetrics(result), nil
+		},
+	}
+}
+
+// FuncsWithExternalURL returns a function map that depends on externalURL value
+func FuncsWithExternalURL(externalURL *url.URL) textTpl.FuncMap {
+	return textTpl.FuncMap{
+		"externalURL": func() string {
+			return externalURL.String()
+		},
+
+		"pathPrefix": func() string {
+			return externalURL.Path
+		},
+	}
+}
 
 // templateFuncs initiates template helper functions
 func templateFuncs() textTpl.FuncMap {
@@ -280,11 +341,21 @@ func templateFuncs() textTpl.FuncMap {
 
 		// externalURL returns value of `external.url` flag
 		"externalURL": func() string {
+			// externalURL function supposed to be substituted at FuncsWithExteralURL().
+			// it is present here only for validation purposes, when there is no
+			// provided datasource.
+			//
+			// return non-empty slice to pass validation with chained functions in template
 			return ""
 		},
 
 		// pathPrefix returns a Path segment from the URL value in `external.url` flag
 		"pathPrefix": func() string {
+			// pathPrefix function supposed to be substituted at FuncsWithExteralURL().
+			// it is present here only for validation purposes, when there is no
+			// provided datasource.
+			//
+			// return non-empty slice to pass validation with chained functions in template
 			return ""
 		},
 
@@ -320,7 +391,7 @@ func templateFuncs() textTpl.FuncMap {
 		// execute "/api/v1/query?query=foo" request and will return
 		// the first value in response.
 		"query": func(q string) ([]metric, error) {
-			// query function supposed to be substituted at funcsWithQuery().
+			// query function supposed to be substituted at FuncsWithQuery().
 			// it is present here only for validation purposes, when there is no
 			// provided datasource.
 			//
@@ -373,30 +444,6 @@ func templateFuncs() textTpl.FuncMap {
 		// safeHtml marks string as HTML not requiring auto-escaping.
 		"safeHtml": func(text string) htmlTpl.HTML {
 			return htmlTpl.HTML(text)
-		},
-	}
-}
-
-func queryFuncs(query QueryFn) textTpl.FuncMap {
-	return textTpl.FuncMap{
-		"query": func(q string) ([]metric, error) {
-			result, err := query(q)
-			if err != nil {
-				return nil, err
-			}
-			return datasourceMetricsToTemplateMetrics(result), nil
-		},
-	}
-}
-
-func externalURLFuncs(externalURL *url.URL) textTpl.FuncMap {
-	return textTpl.FuncMap{
-		"externalURL": func() string {
-			return externalURL.String()
-		},
-
-		"pathPrefix": func() string {
-			return externalURL.Path
 		},
 	}
 }

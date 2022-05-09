@@ -15,6 +15,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/remoteread"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/remotewrite"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/templates"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envflag"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
@@ -80,7 +81,7 @@ func main() {
 	envflag.Parse()
 	buildinfo.Init()
 	logger.Init()
-	err := notifier.LoadTemplates(*ruleTemplatesPath, true)
+	err := templates.Load(*ruleTemplatesPath, true)
 	if err != nil {
 		logger.Fatalf("failed to parse %q: %s", *ruleTemplatesPath, err)
 	}
@@ -302,7 +303,7 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 			logger.Errorf("failed to reload notifier config: %s", err)
 			continue
 		}
-		err := notifier.LoadTemplates(*ruleTemplatesPath, false)
+		err := templates.Load(*ruleTemplatesPath, false)
 		if err != nil {
 			configReloadErrors.Inc()
 			configSuccess.Set(0)
@@ -317,10 +318,10 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 			continue
 		}
 		if configsEqual(newGroupsCfg, groupsCfg) {
-			if err = notifier.ReplaceTemplates(); err != nil {
+			if err = templates.Reload(); err != nil {
 				configReloadErrors.Inc()
 				configSuccess.Set(0)
-				logger.Errorf("cannot replace templates: %s", err)
+				logger.Errorf("cannot reload templates: %s", err)
 				continue
 			}
 			// set success to 1 since previous reload
@@ -335,10 +336,10 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 			logger.Errorf("error while reloading rules: %s", err)
 			continue
 		}
-		if err = notifier.ReplaceTemplates(); err != nil {
+		if err = templates.Reload(); err != nil {
 			configReloadErrors.Inc()
 			configSuccess.Set(0)
-			logger.Errorf("cannot replace templates: %s", err)
+			logger.Errorf("cannot reload templates: %s", err)
 			continue
 		}
 		groupsCfg = newGroupsCfg
