@@ -78,7 +78,7 @@ func Load(pathPatterns []string, overwrite bool) error {
 		return nil
 	}
 	if masterTmpl.replacement, err = tmpl.Clone(); err != nil {
-		return nil
+		return err
 	}
 	for _, tp := range masterTmpl.replacement.Templates() {
 		if masterTmpl.current.Lookup(tp.Name()) == nil {
