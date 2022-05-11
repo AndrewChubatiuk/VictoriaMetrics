@@ -162,11 +162,11 @@ func UpdateWithFuncs(funcs textTpl.FuncMap) {
 // provided with funcs argument
 func GetWithFuncs(funcs textTpl.FuncMap) (*textTpl.Template, error) {
 	tplMu.RLock()
+	defer tplMu.RUnlock()
 	tmpl, err := masterTmpl.current.Clone()
 	if err != nil {
 		return nil, err
 	}
-	tplMu.RUnlock()
 	return tmpl.Funcs(funcs), nil
 }
 
