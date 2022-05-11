@@ -318,12 +318,7 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 			continue
 		}
 		if configsEqual(newGroupsCfg, groupsCfg) {
-			if err = templates.Reload(); err != nil {
-				configReloadErrors.Inc()
-				configSuccess.Set(0)
-				logger.Errorf("cannot reload templates: %s", err)
-				continue
-			}
+			templates.Reload()
 			// set success to 1 since previous reload
 			// could have been unsuccessful
 			configSuccess.Set(1)
@@ -336,12 +331,7 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 			logger.Errorf("error while reloading rules: %s", err)
 			continue
 		}
-		if err = templates.Reload(); err != nil {
-			configReloadErrors.Inc()
-			configSuccess.Set(0)
-			logger.Errorf("cannot reload templates: %s", err)
-			continue
-		}
+		templates.Reload()
 		groupsCfg = newGroupsCfg
 		configSuccess.Set(1)
 		configTimestamp.Set(fasttime.UnixTimestamp())

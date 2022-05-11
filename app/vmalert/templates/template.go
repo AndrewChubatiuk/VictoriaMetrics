@@ -37,21 +37,26 @@ import (
 // go template execution fails when it's tree is empty
 const defaultTemplate = `{{- define "default.template" -}}{{- end -}}`
 
+var tplMu sync.RWMutex
+
 type textTemplate struct {
-	tplMu       sync.RWMutex
 	current     *textTpl.Template
 	replacement *textTpl.Template
 }
 
 var masterTmpl textTemplate
 
+func newTemplate() *textTpl.Template {
+	tmpl := textTpl.New("").Option("missingkey=zero").Funcs(templateFuncs())
+	return textTpl.Must(tmpl.Parse(defaultTemplate))
+}
+
 // Load func loads templates from multiple globs specified in pathPatterns and either
 // sets them directly to current template if it's undefined or with overwrite=true
 // or sets replacement templates and adds templates with new names to a current
 func Load(pathPatterns []string, overwrite bool) error {
 	var err error
-	tmpl := textTpl.New("").Option("missingkey=zero").Funcs(templateFuncs())
-	tmpl = textTpl.Must(tmpl.Parse(defaultTemplate))
+	tmpl := newTemplate()
 	for _, tp := range pathPatterns {
 		p, err := filepath.Glob(tp)
 		if err != nil {
@@ -70,21 +75,36 @@ func Load(pathPatterns []string, overwrite bool) error {
 			return fmt.Errorf("failed to execute template: %w", err)
 		}
 	}
-	masterTmpl.tplMu.Lock()
-	defer masterTmpl.tplMu.Unlock()
+	tplMu.Lock()
+	defer tplMu.Unlock()
 	if masterTmpl.current == nil || overwrite {
 		masterTmpl.replacement = nil
-		masterTmpl.current = tmpl
+		masterTmpl.current = newTemplate()
+	} else {
+		masterTmpl.replacement = newTemplate()
+		if err = copyTemplates(tmpl, masterTmpl.replacement, overwrite); err != nil {
+			return err
+		}
+	}
+	return copyTemplates(tmpl, masterTmpl.current, overwrite)
+}
+
+func copyTemplates(from *textTpl.Template, to *textTpl.Template, overwrite bool) error {
+	if from == nil {
 		return nil
 	}
-	if masterTmpl.replacement, err = tmpl.Clone(); err != nil {
+	if to == nil {
+		to = newTemplate()
+	}
+	tmpl, err := from.Clone()
+	if err != nil {
 		return err
 	}
-	for _, tp := range masterTmpl.replacement.Templates() {
-		if masterTmpl.current.Lookup(tp.Name()) == nil {
-			masterTmpl.current, err = masterTmpl.current.AddParseTree(tp.Name(), tp.Tree)
+	for _, t := range tmpl.Templates() {
+		if to.Lookup(t.Name()) == nil || overwrite {
+			to, err = to.AddParseTree(t.Name(), t.Tree)
 			if err != nil {
-				return fmt.Errorf("failed to add template %q: %w", tp.Name(), err)
+				return fmt.Errorf("failed to add template %q: %w", t.Name(), err)
 			}
 		}
 	}
@@ -93,14 +113,13 @@ func Load(pathPatterns []string, overwrite bool) error {
 
 // Reload func replaces current template with a replacement template
 // which was set by Load with override=false
-func Reload() error {
-	var err error
-	masterTmpl.tplMu.Lock()
-	defer masterTmpl.tplMu.Unlock()
+func Reload() {
+	tplMu.Lock()
+	defer tplMu.Unlock()
 	if masterTmpl.replacement != nil {
-		masterTmpl.current, err = masterTmpl.replacement.Clone()
+		masterTmpl.current = masterTmpl.replacement
+		masterTmpl.replacement = nil
 	}
-	return err
 }
 
 // metric is private copy of datasource.Metric,
@@ -134,27 +153,27 @@ type QueryFn func(query string) ([]datasource.Metric, error)
 
 // UpdateWithFuncs updates existing or sets a new function map for a template
 func UpdateWithFuncs(funcs textTpl.FuncMap) {
-	masterTmpl.tplMu.Lock()
-	defer masterTmpl.tplMu.Unlock()
+	tplMu.Lock()
+	defer tplMu.Unlock()
 	masterTmpl.current = masterTmpl.current.Funcs(funcs)
 }
 
 // GetWithFuncs returns a copy of current template with additional FuncMap
 // provided with funcs argument
 func GetWithFuncs(funcs textTpl.FuncMap) (*textTpl.Template, error) {
-	masterTmpl.tplMu.RLock()
+	tplMu.RLock()
 	tmpl, err := masterTmpl.current.Clone()
 	if err != nil {
 		return nil, err
 	}
-	masterTmpl.tplMu.RUnlock()
+	tplMu.RUnlock()
 	return tmpl.Funcs(funcs), nil
 }
 
 // Get returns a copy of a template
 func Get() (*textTpl.Template, error) {
-	masterTmpl.tplMu.RLock()
-	defer masterTmpl.tplMu.RUnlock()
+	tplMu.RLock()
+	defer tplMu.RUnlock()
 	return masterTmpl.current.Clone()
 }
 
