@@ -135,7 +135,7 @@ func templateAnnotations(annotations map[string]string, data AlertTplData, tmpl 
 		builder.Grow(len(header) + len(text))
 		builder.WriteString(header)
 		builder.WriteString(text)
-		if err := templateAnnotation(&buf, builder.String(), tData, tmpl); err != nil {
+		if err := templateAnnotation(&buf, builder.String(), tData, tmpl, execute); err != nil {
 			r[key] = text
 			eg.Add(fmt.Errorf("key %q, template %q: %w", key, text, err))
 			continue
