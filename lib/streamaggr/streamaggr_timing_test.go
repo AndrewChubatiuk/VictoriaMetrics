@@ -51,9 +51,15 @@ func BenchmarkAggregatorsFlushSerial(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	b.SetBytes(int64(len(benchSeries) * len(outputs)))
+	interval := time.Hour
+	intervalMsec := int64(interval / time.Millisecond)
+	flushTime := time.Now().Truncate(interval).Add(interval)
+	flushTimestamp := flushTime.UnixMilli()
+	windowsSize := 2
+	flushIndex := int(flushTimestamp/intervalMsec) % windowsSize
 	for i := 0; i < b.N; i++ {
 		for _, aggr := range a.as {
-			aggr.flush(pushFunc, time.Hour, time.Now().UnixMilli())
+			aggr.flush(pushFunc, interval, flushTimestamp, flushIndex)
 		}
 	}
 }

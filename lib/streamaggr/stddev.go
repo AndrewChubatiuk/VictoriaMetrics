@@ -3,17 +3,25 @@ package streamaggr
 import (
 	"math"
 	"sync"
+	"time"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 )
 
 // stddevAggrState calculates output=stddev, e.g. the average value over input samples.
 type stddevAggrState struct {
 	m sync.Map
+	// Time series state is dropped if no new samples are received during stalenessMsecs.
+	//
+	// Aslo, the first sample per each new series is ignored during stalenessMsecs even if keepFirstSample is set.
+	stalenessMsecs int64
 }
 
 type stddevStateValue struct {
-	mu      sync.Mutex
-	stddev  map[int64]*stddevState
-	deleted bool
+	mu             sync.Mutex
+	stddev         []*stddevState
+	deleted        bool
+	deleteDeadline int64
 }
 
 type stddevState struct {
@@ -22,12 +30,17 @@ type stddevState struct {
 	q     float64
 }
 
-func newStddevAggrState() *stddevAggrState {
-	return &stddevAggrState{}
+func newStddevAggrState(stalenessInterval time.Duration) *stddevAggrState {
+	stalenessMsecs := durationToMsecs(stalenessInterval)
+	return &stddevAggrState{
+		stalenessMsecs: stalenessMsecs,
+	}
 }
 
-func (as *stddevAggrState) pushSamples(windows map[int64][]pushSample) {
-	for ts, samples := range windows {
+func (as *stddevAggrState) pushSamples(windows [][]pushSample) {
+	currentTime := fasttime.UnixMilli()
+	deleteDeadline := currentTime + as.stalenessMsecs
+	for w, samples := range windows {
 		for i := range samples {
 			s := &samples[i]
 			outputKey := getOutputKey(s.key)
@@ -37,13 +50,9 @@ func (as *stddevAggrState) pushSamples(windows map[int64][]pushSample) {
 			if !ok {
 				// The entry is missing in the map. Try creating it.
 				v = &stddevStateValue{
-					stddev: map[int64]*stddevState{
-						ts: &stddevState{},
-					},
+					stddev: make([]*stddevState, len(windows)),
 				}
-				vNew, loaded := as.m.LoadOrStore(outputKey, v)
-				if loaded {
-					// Use the entry created by a concurrent goroutine.
+				if vNew, loaded := as.m.LoadOrStore(outputKey, v); loaded {
 					v = vNew
 				}
 			}
@@ -52,14 +61,15 @@ func (as *stddevAggrState) pushSamples(windows map[int64][]pushSample) {
 			deleted := sv.deleted
 			if !deleted {
 				// See `Rapid calculation methods` at https://en.wikipedia.org/wiki/Standard_deviation
-				if _, ok := sv.stddev[ts]; !ok {
-					sv.stddev[ts] = &stddevState{}
+				if sv.stddev[w] == nil {
+					sv.stddev[w] = &stddevState{}
 				}
-				v := sv.stddev[ts]
+				v := sv.stddev[w]
 				v.count++
 				avg := v.avg + (s.value-v.avg)/v.count
 				v.q += (s.value - v.avg) * (s.value - avg)
 				v.avg = avg
+				sv.deleteDeadline = deleteDeadline
 			}
 			sv.mu.Unlock()
 			if deleted {
@@ -71,40 +81,27 @@ func (as *stddevAggrState) pushSamples(windows map[int64][]pushSample) {
 	}
 }
 
-func (as *stddevAggrState) flushState(ctx *flushCtx, flushTimestamp int64) {
+func (as *stddevAggrState) flushState(ctx *flushCtx, flushTimestamp int64, w int) {
 	m := &as.m
-	fn := func(states map[int64]*stddevState) map[int64]*stddevState {
-		output := make(map[int64]*stddevState)
-		if flushTimestamp == -1 {
-			for ts, state := range states {
-				output[ts] = state
-				delete(states, ts)
-			}
-		} else if state, ok := states[flushTimestamp]; ok {
-			output[flushTimestamp] = state
-			delete(states, flushTimestamp)
-		}
-		return output
-	}
 	m.Range(func(k, v interface{}) bool {
 		sv := v.(*stddevStateValue)
 		sv.mu.Lock()
-		states := fn(sv.stddev)
-		sv.mu.Unlock()
-		for ts, state := range states {
-			stddev := math.Sqrt(state.q / state.count)
-			key := k.(string)
-			ctx.appendSeries(key, "stddev", ts, stddev)
+		deleted := flushTimestamp > sv.deleteDeadline
+		state := sv.stddev[w]
+		if deleted {
+			// Mark the current entry as deleted
+			sv.deleted = deleted
+		} else if state == nil {
+			sv.mu.Unlock()
+			return true
 		}
-		sv.mu.Lock()
-		if len(sv.stddev) == 0 {
-			// Mark the entry as deleted, so it won't be updated anymore by concurrent pushSample() calls.
-			sv.deleted = true
-			sv.mu.Unlock()
-			// Atomically delete the entry from the map, so new entry is created for the next flush.
+		sv.stddev[w] = nil
+		sv.mu.Unlock()
+		stddev := math.Sqrt(state.q / state.count)
+		key := k.(string)
+		ctx.appendSeries(key, "stddev", flushTimestamp, stddev)
+		if deleted {
 			m.Delete(k)
-		} else {
-			sv.mu.Unlock()
 		}
 		return true
 	})

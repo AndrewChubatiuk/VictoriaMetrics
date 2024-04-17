@@ -345,7 +345,8 @@ type aggregator struct {
 	by                  []string
 	without             []string
 	aggregateOnlyByTime bool
-	interval            int64
+	tickInterval        int64
+	windowsCount        int
 
 	// da is set to non-nil if input samples must be de-duplicated
 	da *dedupAggr
@@ -383,8 +384,8 @@ type aggregator struct {
 }
 
 type aggrState interface {
-	pushSamples(samples map[int64][]pushSample)
-	flushState(ctx *flushCtx, flushTimestamp int64)
+	pushSamples(samples [][]pushSample)
+	flushState(ctx *flushCtx, flushTimestamp int64, winIndex int)
 }
 
 // PushFunc is called by Aggregators when it needs to push its state to metrics storage
@@ -509,7 +510,7 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 				}
 				phis[j] = phi
 			}
-			aggrStates[i] = newQuantilesAggrState(phis)
+			aggrStates[i] = newQuantilesAggrState(stalenessInterval, phis)
 			continue
 		}
 		switch output {
@@ -522,25 +523,25 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 		case "increase_prometheus":
 			aggrStates[i] = newTotalAggrState(stalenessInterval, true, false)
 		case "count_series":
-			aggrStates[i] = newCountSeriesAggrState()
+			aggrStates[i] = newCountSeriesAggrState(stalenessInterval)
 		case "count_samples":
-			aggrStates[i] = newCountSamplesAggrState()
+			aggrStates[i] = newCountSamplesAggrState(stalenessInterval)
 		case "unique_samples":
-			aggrStates[i] = newUniqueSamplesAggrState()
+			aggrStates[i] = newUniqueSamplesAggrState(stalenessInterval)
 		case "sum_samples":
-			aggrStates[i] = newSumSamplesAggrState()
+			aggrStates[i] = newSumSamplesAggrState(stalenessInterval)
 		case "last":
-			aggrStates[i] = newLastAggrState()
+			aggrStates[i] = newLastAggrState(stalenessInterval)
 		case "min":
-			aggrStates[i] = newMinAggrState()
+			aggrStates[i] = newMinAggrState(stalenessInterval)
 		case "max":
-			aggrStates[i] = newMaxAggrState()
+			aggrStates[i] = newMaxAggrState(stalenessInterval)
 		case "avg":
-			aggrStates[i] = newAvgAggrState()
+			aggrStates[i] = newAvgAggrState(stalenessInterval)
 		case "stddev":
-			aggrStates[i] = newStddevAggrState()
+			aggrStates[i] = newStddevAggrState(stalenessInterval)
 		case "stdvar":
-			aggrStates[i] = newStdvarAggrState()
+			aggrStates[i] = newStdvarAggrState(stalenessInterval)
 		case "histogram_bucket":
 			aggrStates[i] = newHistogramBucketAggrState(stalenessInterval)
 		default:
@@ -572,7 +573,8 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 		by:                  by,
 		without:             without,
 		aggregateOnlyByTime: aggregateOnlyByTime,
-		interval:            interval.Milliseconds(),
+		tickInterval:        interval.Milliseconds(),
+		windowsCount:        2,
 
 		aggrStates: aggrStates,
 
@@ -591,7 +593,8 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 	}
 	if dedupInterval > 0 {
 		a.da = newDedupAggr()
-		a.interval = dedupInterval.Milliseconds()
+		a.tickInterval = dedupInterval.Milliseconds()
+		a.windowsCount = a.windowsCount * int(interval/dedupInterval)
 	}
 
 	alignFlushToInterval := !opts.NoAlignFlushToInterval
@@ -634,7 +637,7 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, allowIn
 	}
 
 	flushDeadline := time.Now().Truncate(interval).Add(interval)
-	tickInterval := time.Duration(a.interval) * time.Millisecond
+	tickInterval := time.Duration(a.tickInterval) * time.Millisecond
 
 	if alignedSleep(tickInterval) {
 		flushDeadline = time.Now().Truncate(interval).Add(interval)
@@ -660,10 +663,10 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, allowIn
 				} else {
 					time.Sleep(flushAfter)
 				}
-				a.dedupFlush(dedupInterval, dedupTime.UnixMilli(), flushDeadline.UnixMilli())
+				dedupIndex, flushIndex := a.getFlushIndices(dedupInterval, interval, dedupTime, flushDeadline)
+				a.dedupFlush(dedupInterval, dedupIndex, flushIndex)
 				if tick.After(flushDeadline) {
-					a.flush(pf, interval, flushDeadline.UnixMilli())
-					flushDeadline = flushDeadline.Add(interval)
+					a.flush(pf, interval, flushDeadline.UnixMilli(), flushIndex)
 					pf = pushFunc
 				}
 
@@ -678,12 +681,30 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, allowIn
 	}
 	if allowIncompleteFlush {
 		dedupTime := time.Now().Truncate(tickInterval).Add(tickInterval)
-		a.dedupFlush(dedupInterval, dedupTime.UnixMilli(), flushDeadline.UnixMilli())
-		a.flush(pushFunc, interval, flushDeadline.UnixMilli())
+		dedupIndex, flushIndex := a.getFlushIndices(dedupInterval, interval, dedupTime, flushDeadline)
+		a.dedupFlush(dedupInterval, dedupIndex, flushIndex)
+		a.flush(pushFunc, interval, flushDeadline.UnixMilli(), flushIndex)
 	}
 }
 
-func (a *aggregator) dedupFlush(dedupInterval time.Duration, dedupTimestamp, flushTimestamp int64) {
+func (a *aggregator) getFlushIndices(dedupInterval, interval time.Duration, dedupTime, flushTime time.Time) (int, int) {
+	flushTimestamp := flushTime.UnixMilli()
+	flushIntervals := int(flushTimestamp / int64(interval/time.Millisecond))
+	var dedupIndex, flushIndex int
+	if dedupInterval > 0 {
+		dedupTimestamp := dedupTime.UnixMilli()
+		dedupIntervals := int(dedupTimestamp / int64(dedupInterval/time.Millisecond))
+		intervalsRatio := int(interval / dedupInterval)
+		dedupIndex = dedupIntervals % a.windowsCount
+		flushIndex = flushIntervals % (a.windowsCount / intervalsRatio)
+	} else {
+		flushIndex = flushIntervals % a.windowsCount
+		dedupIndex = flushIndex
+	}
+	return dedupIndex, flushIndex
+}
+
+func (a *aggregator) dedupFlush(dedupInterval time.Duration, dedupIndex, flushIndex int) {
 	if dedupInterval <= 0 {
 		// The de-duplication is disabled.
 		return
@@ -691,7 +712,7 @@ func (a *aggregator) dedupFlush(dedupInterval time.Duration, dedupTimestamp, flu
 
 	startTime := time.Now()
 
-	a.da.flush(a.pushSamples, dedupTimestamp, flushTimestamp)
+	a.da.flush(a.pushSamples, dedupIndex, flushIndex)
 
 	d := time.Since(startTime)
 	a.dedupFlushDuration.Update(d.Seconds())
@@ -703,7 +724,7 @@ func (a *aggregator) dedupFlush(dedupInterval time.Duration, dedupTimestamp, flu
 	}
 }
 
-func (a *aggregator) flush(pushFunc PushFunc, interval time.Duration, flushTimestamp int64) {
+func (a *aggregator) flush(pushFunc PushFunc, interval time.Duration, flushTimestamp int64, flushIndex int) {
 	startTime := time.Now()
 	var wg sync.WaitGroup
 	for _, as := range a.aggrStates {
@@ -717,7 +738,7 @@ func (a *aggregator) flush(pushFunc PushFunc, interval time.Duration, flushTimes
 
 			ctx := getFlushCtx(a, pushFunc)
 			a.minTimestamp.Store(flushTimestamp)
-			as.flushState(ctx, flushTimestamp)
+			as.flushState(ctx, flushTimestamp, flushIndex)
 			ctx.flushSeries()
 			ctx.resetSeries()
 			putFlushCtx(ctx)
@@ -747,7 +768,7 @@ func (a *aggregator) MustStop() {
 
 // Push pushes tss to a.
 func (a *aggregator) Push(tss []prompbmarshal.TimeSeries, matchIdxs []byte) {
-	ctx := getPushCtx()
+	ctx := getPushCtx(a.windowsCount)
 	defer putPushCtx(ctx)
 
 	ctx.reset()
@@ -803,12 +824,9 @@ func (a *aggregator) Push(tss []prompbmarshal.TimeSeries, matchIdxs []byte) {
 				continue
 			}
 
-			flushTimestamp := (sample.Timestamp/a.interval + 1) * a.interval
-			if _, ok := samples[flushTimestamp]; !ok {
-				samples[flushTimestamp] = make([]pushSample, 0)
-			}
+			w := int(sample.Timestamp/a.tickInterval+1) % a.windowsCount
 
-			samples[flushTimestamp] = append(samples[flushTimestamp], pushSample{
+			samples[w] = append(samples[w], pushSample{
 				key:       key,
 				value:     sample.Value,
 				timestamp: sample.Timestamp,
@@ -860,14 +878,14 @@ func getInputOutputKey(key string) (string, string) {
 	return bytesutil.ToUnsafeString(inputKey), bytesutil.ToUnsafeString(outputKey)
 }
 
-func (a *aggregator) pushSamples(samples map[int64][]pushSample) {
+func (a *aggregator) pushSamples(samples [][]pushSample) {
 	for _, as := range a.aggrStates {
 		as.pushSamples(samples)
 	}
 }
 
 type pushCtx struct {
-	samples      map[int64][]pushSample
+	samples      [][]pushSample
 	labels       promutils.Labels
 	inputLabels  promutils.Labels
 	outputLabels promutils.Labels
@@ -876,7 +894,9 @@ type pushCtx struct {
 
 func (ctx *pushCtx) reset() {
 	clear(ctx.samples)
-	ctx.samples = make(map[int64][]pushSample)
+	for s := range ctx.samples {
+		ctx.samples[s] = ctx.samples[s][:0]
+	}
 
 	ctx.labels.Reset()
 	ctx.inputLabels.Reset()
@@ -890,12 +910,23 @@ type pushSample struct {
 	timestamp int64
 }
 
-func getPushCtx() *pushCtx {
+func getPushCtx(w int) *pushCtx {
 	v := pushCtxPool.Get()
 	if v == nil {
-		return &pushCtx{}
+		return &pushCtx{
+			samples: make([][]pushSample, w),
+		}
 	}
-	return v.(*pushCtx)
+	ctx := v.(*pushCtx)
+	if len(ctx.samples) != w {
+		samplesCap := cap(ctx.samples)
+		if cap(ctx.samples) < w {
+			ctx.samples = append(ctx.samples[:samplesCap], make([][]pushSample, w-samplesCap)...)
+		} else {
+			ctx.samples = ctx.samples[:w]
+		}
+	}
+	return ctx
 }
 
 func putPushCtx(ctx *pushCtx) {

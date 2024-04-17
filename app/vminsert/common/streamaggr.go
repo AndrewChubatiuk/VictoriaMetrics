@@ -76,7 +76,7 @@ func InitStreamAggr() {
 
 	if *streamAggrConfig == "" {
 		if *streamAggrDedupInterval > 0 {
-			deduplicator = streamaggr.NewDeduplicator(pushAggregateSeries, *streamAggrDedupInterval, *streamAggrDropInputLabels)
+			deduplicator = streamaggr.NewDeduplicator(pushAggregateSeries, *streamAggrDedupInterval, *streamAggrDropInputLabels, 4)
 		}
 		return
 	}

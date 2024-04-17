@@ -24,7 +24,7 @@ type dedupAggrShard struct {
 
 type dedupAggrShardNopad struct {
 	mu sync.Mutex
-	m  map[int64]map[string]*dedupAggrSample
+	m  []map[string]*dedupAggrSample
 }
 
 type dedupAggrSample struct {
@@ -77,10 +77,10 @@ func (das *dedupAggrShard) itemsCount() uint64 {
 	return n
 }
 
-func (da *dedupAggr) pushSamples(windows map[int64][]pushSample) {
+func (da *dedupAggr) pushSamples(windows [][]pushSample) {
 	pss := getPerShardSamples()
 	shards := pss.shards
-	for ts, samples := range windows {
+	for w, samples := range windows {
 		for _, sample := range samples {
 			h := xxhash.Sum64(bytesutil.ToUnsafeBytes(sample.key))
 			idx := h % uint64(len(shards))
@@ -90,16 +90,27 @@ func (da *dedupAggr) pushSamples(windows map[int64][]pushSample) {
 			if len(shardSamples) == 0 {
 				continue
 			}
-			da.shards[i].pushSamples(shardSamples, ts)
+			da.shards[i].pushSamples(shardSamples, len(windows), w)
 		}
 	}
 	putPerShardSamples(pss)
 }
 
-func getDedupFlushCtx() *dedupFlushCtx {
+func getDedupFlushCtx(w int) *dedupFlushCtx {
 	v := dedupFlushCtxPool.Get()
 	if v == nil {
-		return &dedupFlushCtx{}
+		return &dedupFlushCtx{
+			samples: make([][]pushSample, w),
+		}
+	}
+	ctx := v.(*dedupFlushCtx)
+	if len(ctx.samples) != w {
+		samplesCap := cap(ctx.samples)
+		if cap(ctx.samples) < w {
+			ctx.samples = append(ctx.samples[:samplesCap], make([][]pushSample, w-samplesCap)...)
+		} else {
+			ctx.samples = ctx.samples[:w]
+		}
 	}
 	return v.(*dedupFlushCtx)
 }
@@ -112,15 +123,16 @@ func putDedupFlushCtx(ctx *dedupFlushCtx) {
 var dedupFlushCtxPool sync.Pool
 
 type dedupFlushCtx struct {
-	samples map[int64][]pushSample
+	samples [][]pushSample
 }
 
 func (ctx *dedupFlushCtx) reset() {
-	clear(ctx.samples)
-	ctx.samples = make(map[int64][]pushSample)
+	for s := range ctx.samples {
+		ctx.samples[s] = ctx.samples[s][:0]
+	}
 }
 
-func (da *dedupAggr) flush(f func(samples map[int64][]pushSample), dedupTimestamp, flushTimestamp int64) {
+func (da *dedupAggr) flush(f func(samples [][]pushSample), dedupIndex, flushIndex int) {
 	var wg sync.WaitGroup
 	for i := range da.shards {
 		flushConcurrencyCh <- struct{}{}
@@ -131,9 +143,9 @@ func (da *dedupAggr) flush(f func(samples map[int64][]pushSample), dedupTimestam
 				wg.Done()
 			}()
 
-			ctx := getDedupFlushCtx()
-			shard.flush(ctx, f, dedupTimestamp, flushTimestamp)
-			putDedupFlushCtx(ctx)
+			var ctx dedupFlushCtx
+			shard.flush(&ctx, f, dedupIndex, flushIndex)
+			putDedupFlushCtx(&ctx)
 		}(&da.shards[i])
 	}
 	wg.Wait()
@@ -170,25 +182,25 @@ func putPerShardSamples(pss *perShardSamples) {
 
 var perShardSamplesPool sync.Pool
 
-func (das *dedupAggrShard) pushSamples(samples []pushSample, ts int64) {
+func (das *dedupAggrShard) pushSamples(samples []pushSample, windowsCount, w int) {
 	das.mu.Lock()
 	defer das.mu.Unlock()
 
 	if das.m == nil {
-		das.m = make(map[int64]map[string]*dedupAggrSample, 0)
+		das.m = make([]map[string]*dedupAggrSample, windowsCount)
 	}
 	for _, sample := range samples {
-		if _, ok := das.m[ts]; !ok {
-			das.m[ts] = map[string]*dedupAggrSample{}
+		if das.m[w] == nil {
+			das.m[w] = make(map[string]*dedupAggrSample)
 		}
-		if s, ok := das.m[ts][sample.key]; !ok {
-			das.m[ts][sample.key] = &dedupAggrSample{
+		if s, ok := das.m[w][sample.key]; !ok {
+			das.m[w][sample.key] = &dedupAggrSample{
 				value:     sample.value,
 				timestamp: sample.timestamp,
 			}
 		} else if sample.timestamp > s.timestamp || (sample.timestamp == s.timestamp && sample.value > s.value) {
 			// Update the existing value according to logic described at https://docs.victoriametrics.com/#deduplication
-			das.m[ts][sample.key] = &dedupAggrSample{
+			das.m[w][sample.key] = &dedupAggrSample{
 				value:     sample.value,
 				timestamp: sample.timestamp,
 			}
@@ -196,43 +208,31 @@ func (das *dedupAggrShard) pushSamples(samples []pushSample, ts int64) {
 	}
 }
 
-func (das *dedupAggrShard) flush(ctx *dedupFlushCtx, f func(samples map[int64][]pushSample), dedupTimestamp, flushTimestamp int64) {
-	fn := func(states map[int64]map[string]*dedupAggrSample) map[string]*dedupAggrSample {
-		if dedupTimestamp > 0 && flushTimestamp > 0 {
-			if state, ok := states[dedupTimestamp]; ok {
-				delete(states, dedupTimestamp)
-				return state
-			}
-		} else {
-			for ts := range states {
-				delete(states, ts)
-			}
-		}
-		return states[-1]
-	}
+func (das *dedupAggrShard) flush(ctx *dedupFlushCtx, f func(samples [][]pushSample), dedupIndex, flushIndex int) {
 	das.mu.Lock()
-	state := fn(das.m)
-	das.mu.Unlock()
-	ctx.reset()
-
-	for key, s := range state {
-		if _, ok := ctx.samples[flushTimestamp]; !ok {
-			ctx.samples[flushTimestamp] = make([]pushSample, 0)
-		}
-		ctx.samples[flushTimestamp] = append(ctx.samples[flushTimestamp], pushSample{
-			key:       key,
-			value:     s.value,
-			timestamp: s.timestamp,
-		})
-		// Limit the number of samples per each flush in order to limit memory usage.
-		if len(ctx.samples[flushTimestamp]) >= 100_000 {
-			f(ctx.samples)
-			clear(ctx.samples)
-		}
-	}
-
-	if len(ctx.samples) == 0 {
+	if len(das.m) == 0 {
+		das.mu.Unlock()
 		return
+	}
+	ctx = getDedupFlushCtx(len(das.m))
+	state := das.m[dedupIndex]
+	if state != nil {
+		das.m[dedupIndex] = nil
+		das.mu.Unlock()
+		for key, s := range state {
+			ctx.samples[flushIndex] = append(ctx.samples[flushIndex], pushSample{
+				key:       key,
+				value:     s.value,
+				timestamp: s.timestamp,
+			})
+			// Limit the number of samples per each flush in order to limit memory usage.
+			if len(ctx.samples[flushIndex]) >= 100_000 {
+				f(ctx.samples)
+				clear(ctx.samples)
+			}
+		}
+	} else {
+		das.mu.Unlock()
 	}
 
 	f(ctx.samples)

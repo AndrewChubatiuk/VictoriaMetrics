@@ -23,7 +23,8 @@ type Deduplicator struct {
 	wg     sync.WaitGroup
 	stopCh chan struct{}
 
-	ms *metrics.Set
+	ms           *metrics.Set
+	windowsCount int
 
 	dedupFlushDuration *metrics.Histogram
 	dedupFlushTimeouts *metrics.Counter
@@ -37,15 +38,16 @@ type Deduplicator struct {
 // Common case is to drop `replica`-like labels from samples received from HA datasources.
 //
 // MustStop must be called on the returned deduplicator in order to free up occupied resources.
-func NewDeduplicator(pushFunc PushFunc, dedupInterval time.Duration, dropLabels []string) *Deduplicator {
+func NewDeduplicator(pushFunc PushFunc, dedupInterval time.Duration, dropLabels []string, windowsCount int) *Deduplicator {
 	d := &Deduplicator{
 		da: newDedupAggr(),
 
 		dropLabels:    dropLabels,
 		dedupInterval: dedupInterval.Milliseconds(),
 
-		stopCh: make(chan struct{}),
-		ms:     metrics.NewSet(),
+		stopCh:       make(chan struct{}),
+		ms:           metrics.NewSet(),
+		windowsCount: windowsCount,
 	}
 
 	ms := d.ms
@@ -88,7 +90,7 @@ func (d *Deduplicator) MustStop() {
 
 // Push pushes tss to d.
 func (d *Deduplicator) Push(tss []prompbmarshal.TimeSeries) {
-	ctx := getDeduplicatorPushCtx()
+	ctx := getDeduplicatorPushCtx(d.windowsCount)
 	ctx.reset()
 	pss := ctx.pss
 	labels := &ctx.labels
@@ -109,11 +111,9 @@ func (d *Deduplicator) Push(tss []prompbmarshal.TimeSeries) {
 		buf = d.lc.Compress(buf[:0], labels.Labels)
 		key := bytesutil.InternBytes(buf)
 		for _, s := range ts.Samples {
-			flushTimestamp := (s.Timestamp/d.dedupInterval + 1) * d.dedupInterval
-			if _, ok := pss[flushTimestamp]; !ok {
-				pss[flushTimestamp] = make([]pushSample, 0)
-			}
-			pss[flushTimestamp] = append(pss[flushTimestamp], pushSample{
+			flushIntervals := s.Timestamp/d.dedupInterval + 1
+			flushIndex := int(flushIntervals % int64(d.windowsCount))
+			pss[flushIndex] = append(pss[flushIndex], pushSample{
 				key:       key,
 				value:     s.Value,
 				timestamp: s.Timestamp,
@@ -145,22 +145,24 @@ func (d *Deduplicator) runFlusher(pushFunc PushFunc, dedupInterval time.Duration
 		case <-d.stopCh:
 			return
 		case now := <-t.C:
-			upperBound := now.Truncate(dedupInterval).Add(dedupInterval)
-			flushTimestamp := upperBound.UnixMilli()
-			d.flush(pushFunc, dedupInterval, flushTimestamp)
+			flushTime := now.Truncate(dedupInterval).Add(dedupInterval)
+			flushTimestamp := flushTime.UnixMilli()
+			flushIntervals := int(flushTimestamp / int64(dedupInterval/time.Millisecond))
+			flushIndex := flushIntervals % d.windowsCount
+			d.flush(pushFunc, dedupInterval, flushIndex)
 		}
 	}
 }
 
-func (d *Deduplicator) flush(pushFunc PushFunc, dedupInterval time.Duration, flushTimestamp int64) {
+func (d *Deduplicator) flush(pushFunc PushFunc, dedupInterval time.Duration, w int) {
 	startTime := time.Now()
-	d.da.flush(func(pss map[int64][]pushSample) {
+	d.da.flush(func(pss [][]pushSample) {
 		ctx := getDeduplicatorFlushCtx()
 
 		tss := ctx.tss
 		labels := ctx.labels
 		samples := ctx.samples
-		for _, ps := range pss[flushTimestamp] {
+		for _, ps := range pss[w] {
 			labelsLen := len(labels)
 			labels = decompressLabels(labels, &d.lc, ps.key)
 
@@ -181,7 +183,7 @@ func (d *Deduplicator) flush(pushFunc PushFunc, dedupInterval time.Duration, flu
 		ctx.labels = labels
 		ctx.samples = samples
 		putDeduplicatorFlushCtx(ctx)
-	}, flushTimestamp, flushTimestamp)
+	}, w, w)
 
 	duration := time.Since(startTime)
 	d.dedupFlushDuration.Update(duration.Seconds())
@@ -194,24 +196,28 @@ func (d *Deduplicator) flush(pushFunc PushFunc, dedupInterval time.Duration, flu
 }
 
 type deduplicatorPushCtx struct {
-	pss    map[int64][]pushSample
+	pss    [][]pushSample
 	labels promutils.Labels
 	buf    []byte
 }
 
 func (ctx *deduplicatorPushCtx) reset() {
 	clear(ctx.pss)
-	ctx.pss = make(map[int64][]pushSample)
+	for i := range ctx.pss {
+		ctx.pss[i] = ctx.pss[i][:0]
+	}
 
 	ctx.labels.Reset()
 
 	ctx.buf = ctx.buf[:0]
 }
 
-func getDeduplicatorPushCtx() *deduplicatorPushCtx {
+func getDeduplicatorPushCtx(windowsCount int) *deduplicatorPushCtx {
 	v := deduplicatorPushCtxPool.Get()
 	if v == nil {
-		return &deduplicatorPushCtx{}
+		return &deduplicatorPushCtx{
+			pss: make([][]pushSample, windowsCount),
+		}
 	}
 	return v.(*deduplicatorPushCtx)
 }

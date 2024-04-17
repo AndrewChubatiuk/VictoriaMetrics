@@ -5,7 +5,6 @@ import (
 	"reflect"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestDedupAggrSerial(t *testing.T) {
@@ -13,13 +12,13 @@ func TestDedupAggrSerial(t *testing.T) {
 
 	const seriesCount = 100_000
 	expectedSamplesMap := make(map[string]pushSample)
-	flushTimestamp := time.Now().UnixMilli()
-	dedupTimestamp := flushTimestamp
+	flushIndex := 0
+	dedupIndex := 0
 	for i := 0; i < 2; i++ {
-		windows := map[int64][]pushSample{}
-		windows[flushTimestamp] = make([]pushSample, seriesCount)
-		for j := range windows[flushTimestamp] {
-			sample := &windows[flushTimestamp][j]
+		windows := [][]pushSample{}
+		windows = append(windows, make([]pushSample, seriesCount))
+		for j := range windows[flushIndex] {
+			sample := &windows[flushIndex][j]
 			sample.key = fmt.Sprintf("key_%d", j)
 			sample.value = float64(i + j)
 			expectedSamplesMap[sample.key] = *sample
@@ -36,14 +35,14 @@ func TestDedupAggrSerial(t *testing.T) {
 
 	flushedSamplesMap := make(map[string]pushSample)
 	var mu sync.Mutex
-	flushSamples := func(samples map[int64][]pushSample) {
+	flushSamples := func(samples [][]pushSample) {
 		mu.Lock()
-		for _, sample := range samples[flushTimestamp] {
+		for _, sample := range samples[flushIndex] {
 			flushedSamplesMap[sample.key] = sample
 		}
 		mu.Unlock()
 	}
-	da.flush(flushSamples, dedupTimestamp, flushTimestamp)
+	da.flush(flushSamples, dedupIndex, flushIndex)
 
 	if !reflect.DeepEqual(expectedSamplesMap, flushedSamplesMap) {
 		t.Fatalf("unexpected samples;\ngot\n%v\nwant\n%v", flushedSamplesMap, expectedSamplesMap)
@@ -67,12 +66,12 @@ func TestDedupAggrConcurrent(_ *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			flushTimestamp := time.Now().UnixMilli()
+			flushIndex := 0
 			for i := 0; i < 10; i++ {
-				windows := map[int64][]pushSample{}
-				windows[flushTimestamp] = make([]pushSample, seriesCount)
-				for j := range windows[flushTimestamp] {
-					sample := &windows[flushTimestamp][j]
+				windows := make([][]pushSample, flushIndex+1)
+				windows[flushIndex] = make([]pushSample, seriesCount)
+				for j := range windows[flushIndex] {
+					sample := &windows[flushIndex][j]
 					sample.key = fmt.Sprintf("key_%d", j)
 					sample.value = float64(i + j)
 				}

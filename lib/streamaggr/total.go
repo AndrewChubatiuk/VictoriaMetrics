@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
-	"go.uber.org/atomic"
 )
 
 // totalAggrState calculates output=total, e.g. the summary counter over input counters.
@@ -30,8 +29,8 @@ type totalAggrState struct {
 type totalStateValue struct {
 	mu             sync.Mutex
 	lastValues     map[string]lastValueState
-	total          map[int64]float64
-	totalState     atomic.Float64
+	total          []*float64
+	totalState     float64
 	deleteDeadline int64
 	deleted        bool
 }
@@ -56,10 +55,10 @@ func newTotalAggrState(stalenessInterval time.Duration, resetTotalOnFlush, keepF
 	}
 }
 
-func (as *totalAggrState) pushSamples(windows map[int64][]pushSample) {
+func (as *totalAggrState) pushSamples(windows [][]pushSample) {
 	currentTime := fasttime.UnixMilli()
 	deleteDeadline := currentTime + as.stalenessMsecs
-	for ts, samples := range windows {
+	for w, samples := range windows {
 		for i := range samples {
 			s := &samples[i]
 			inputKey, outputKey := getInputOutputKey(s.key)
@@ -70,11 +69,9 @@ func (as *totalAggrState) pushSamples(windows map[int64][]pushSample) {
 				// The entry is missing in the map. Try creating it.
 				v = &totalStateValue{
 					lastValues: make(map[string]lastValueState),
-					total:      make(map[int64]float64),
+					total:      make([]*float64, len(windows)),
 				}
-				vNew, loaded := as.m.LoadOrStore(outputKey, v)
-				if loaded {
-					// Use the entry created by a concurrent goroutine.
+				if vNew, loaded := as.m.LoadOrStore(outputKey, v); loaded {
 					v = vNew
 				}
 			}
@@ -89,14 +86,16 @@ func (as *totalAggrState) pushSamples(windows map[int64][]pushSample) {
 						sv.mu.Unlock()
 						continue
 					}
+					if sv.total[w] == nil {
+						var t float64
+						sv.total[w] = &t
+					}
 					if s.value >= lv.value {
-						sv.total[ts] += s.value - lv.value
+						*sv.total[w] += s.value - lv.value
 					} else {
 						// counter reset
-						sv.total[ts] += s.value
+						*sv.total[w] += s.value
 					}
-				} else if _, ok := sv.total[ts]; !ok {
-					sv.total[ts] = 0
 				}
 				lv.value = s.value
 				lv.timestamp = s.timestamp
@@ -119,7 +118,7 @@ func (as *totalAggrState) removeOldEntries(currentTime int64) {
 	m.Range(func(k, v interface{}) bool {
 		sv := v.(*totalStateValue)
 		sv.mu.Lock()
-		deleted := currentTime > sv.deleteDeadline || len(sv.total) == 0
+		deleted := currentTime > sv.deleteDeadline
 		if deleted {
 			// Mark the current entry as deleted
 			sv.deleted = deleted
@@ -141,41 +140,32 @@ func (as *totalAggrState) removeOldEntries(currentTime int64) {
 	})
 }
 
-func (as *totalAggrState) flushState(ctx *flushCtx, flushTimestamp int64) {
+func (as *totalAggrState) flushState(ctx *flushCtx, flushTimestamp int64, w int) {
 	as.removeOldEntries(flushTimestamp)
 	m := &as.m
-	fn := func(states map[int64]float64) []float64 {
-		output := make([]float64, 0)
-		if flushTimestamp == -1 {
-			for ts := range states {
-				delete(states, ts)
-			}
-		} else if state, ok := states[flushTimestamp]; ok {
-			output = append(output, state)
-			delete(states, flushTimestamp)
-		}
-		return output
-	}
 	m.Range(func(k, v interface{}) bool {
 		sv := v.(*totalStateValue)
 		sv.mu.Lock()
-		states := fn(sv.total)
+		state := sv.total[w]
+		if state == nil {
+			sv.mu.Unlock()
+			return true
+		}
+		sv.total[w] = nil
 		deleted := sv.deleted
+		if as.resetTotalOnFlush {
+			sv.totalState = 0
+		} else if math.Abs(*state) >= (1 << 53) {
+			// It is time to reset the entry, since it starts losing float64 precision
+			sv.totalState = 0
+		} else {
+			*state += sv.totalState.Load()
+			sv.totalState = *state
+		}
 		sv.mu.Unlock()
-		for _, state := range states {
-			if as.resetTotalOnFlush {
-				sv.totalState.Store(0)
-			} else if math.Abs(state) >= (1 << 53) {
-				// It is time to reset the entry, since it starts losing float64 precision
-				sv.totalState.Store(0)
-			} else {
-				state += sv.totalState.Load()
-				sv.totalState.Store(state)
-			}
-			if !deleted {
-				key := k.(string)
-				ctx.appendSeries(key, as.suffix, flushTimestamp, state)
-			}
+		if !deleted {
+			key := k.(string)
+			ctx.appendSeries(key, as.suffix, flushTimestamp, *state)
 		}
 		return true
 	})

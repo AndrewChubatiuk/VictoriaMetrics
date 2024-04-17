@@ -2,28 +2,41 @@ package streamaggr
 
 import (
 	"sync"
+	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/cespare/xxhash/v2"
 )
 
 // countSeriesAggrState calculates output=count_series, e.g. the number of unique series.
 type countSeriesAggrState struct {
 	m sync.Map
+
+	// Time series state is dropped if no new samples are received during stalenessMsecs.
+	//
+	// Aslo, the first sample per each new series is ignored during stalenessMsecs even if keepFirstSample is set.
+	stalenessMsecs int64
 }
 
 type countSeriesStateValue struct {
-	mu      sync.Mutex
-	m       map[int64]map[uint64]struct{}
-	deleted bool
+	mu             sync.Mutex
+	m              []map[uint64]struct{}
+	deleted        bool
+	deleteDeadline int64
 }
 
-func newCountSeriesAggrState() *countSeriesAggrState {
-	return &countSeriesAggrState{}
+func newCountSeriesAggrState(stalenessInterval time.Duration) *countSeriesAggrState {
+	stalenessMsecs := durationToMsecs(stalenessInterval)
+	return &countSeriesAggrState{
+		stalenessMsecs: stalenessMsecs,
+	}
 }
 
-func (as *countSeriesAggrState) pushSamples(windows map[int64][]pushSample) {
-	for ts, samples := range windows {
+func (as *countSeriesAggrState) pushSamples(windows [][]pushSample) {
+	currentTime := fasttime.UnixMilli()
+	deleteDeadline := currentTime + as.stalenessMsecs
+	for w, samples := range windows {
 		for i := range samples {
 			s := &samples[i]
 			inputKey, outputKey := getInputOutputKey(s.key)
@@ -37,32 +50,23 @@ func (as *countSeriesAggrState) pushSamples(windows map[int64][]pushSample) {
 			if !ok {
 				// The entry is missing in the map. Try creating it.
 				v = &countSeriesStateValue{
-					m: map[int64]map[uint64]struct{}{
-						ts: map[uint64]struct{}{
-							h: {},
-						},
-					},
+					m: make([]map[uint64]struct{}, len(windows)),
 				}
-				vNew, loaded := as.m.LoadOrStore(outputKey, v)
-				if !loaded {
-					// The entry has been added to the map.
-					continue
+				if vNew, loaded := as.m.LoadOrStore(outputKey, v); loaded {
+					v = vNew
 				}
-				// Update the entry created by a concurrent goroutine.
-				v = vNew
 			}
 			sv := v.(*countSeriesStateValue)
 			sv.mu.Lock()
 			deleted := sv.deleted
 			if !deleted {
-				if _, ok := sv.m[ts]; !ok {
-					sv.m[ts] = map[uint64]struct{}{
-						h: {},
-					}
+				if sv.m[w] == nil {
+					sv.m[w] = make(map[uint64]struct{})
 				}
-				if _, ok := sv.m[ts][h]; !ok {
-					sv.m[ts][h] = struct{}{}
+				if _, ok := sv.m[w][h]; !ok {
+					sv.m[w][h] = struct{}{}
 				}
+				sv.deleteDeadline = deleteDeadline
 			}
 			sv.mu.Unlock()
 			if deleted {
@@ -74,38 +78,28 @@ func (as *countSeriesAggrState) pushSamples(windows map[int64][]pushSample) {
 	}
 }
 
-func (as *countSeriesAggrState) flushState(ctx *flushCtx, flushTimestamp int64) {
+func (as *countSeriesAggrState) flushState(ctx *flushCtx, flushTimestamp int64, w int) {
 	m := &as.m
-	fn := func(states map[int64]map[uint64]struct{}) map[int64]map[uint64]struct{} {
-		output := make(map[int64]map[uint64]struct{})
-		if flushTimestamp == -1 {
-			for ts, state := range states {
-				output[ts] = state
-				delete(states, ts)
-			}
-		} else if state, ok := states[flushTimestamp]; ok {
-			output[flushTimestamp] = state
-			delete(states, flushTimestamp)
-		}
-		return output
-	}
 	m.Range(func(k, v interface{}) bool {
 		sv := v.(*countSeriesStateValue)
 		sv.mu.Lock()
-		states := fn(sv.m)
-		sv.mu.Unlock()
-		for ts, m := range states {
-			key := k.(string)
-			ctx.appendSeries(key, "count_series", ts, float64(len(m)))
-		}
-		sv.mu.Lock()
-		if len(sv.m) == 0 {
-			// Mark the entry as deleted, so it won't be updated anymore by concurrent pushSample() calls.
-			sv.deleted = true
+		deleted := flushTimestamp > sv.deleteDeadline
+		state := sv.m[w]
+		if deleted {
+			// Mark the current entry as deleted
+			sv.deleted = deleted
+		} else if state == nil {
 			sv.mu.Unlock()
-			// Atomically delete the entry from the map, so new entry is created for the next flush.
+			return true
+		}
+		sv.mu.Unlock()
+		key := k.(string)
+		ctx.appendSeries(key, "count_series", flushTimestamp, float64(len(state)))
+		if deleted {
 			m.Delete(k)
 		} else {
+			sv.mu.Lock()
+			clear(sv.m[w])
 			sv.mu.Unlock()
 		}
 		return true

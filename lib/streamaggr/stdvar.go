@@ -2,17 +2,25 @@ package streamaggr
 
 import (
 	"sync"
+	"time"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 )
 
 // stdvarAggrState calculates output=stdvar, e.g. the average value over input samples.
 type stdvarAggrState struct {
 	m sync.Map
+	// Time series state is dropped if no new samples are received during stalenessMsecs.
+	//
+	// Aslo, the first sample per each new series is ignored during stalenessMsecs even if keepFirstSample is set.
+	stalenessMsecs int64
 }
 
 type stdvarStateValue struct {
-	mu      sync.Mutex
-	stdvar  map[int64]*stdvarState
-	deleted bool
+	mu             sync.Mutex
+	stdvar         []*stdvarState
+	deleted        bool
+	deleteDeadline int64
 }
 
 type stdvarState struct {
@@ -21,12 +29,17 @@ type stdvarState struct {
 	q     float64
 }
 
-func newStdvarAggrState() *stdvarAggrState {
-	return &stdvarAggrState{}
+func newStdvarAggrState(stalenessInterval time.Duration) *stdvarAggrState {
+	stalenessMsecs := durationToMsecs(stalenessInterval)
+	return &stdvarAggrState{
+		stalenessMsecs: stalenessMsecs,
+	}
 }
 
-func (as *stdvarAggrState) pushSamples(windows map[int64][]pushSample) {
-	for ts, samples := range windows {
+func (as *stdvarAggrState) pushSamples(windows [][]pushSample) {
+	currentTime := fasttime.UnixMilli()
+	deleteDeadline := currentTime + as.stalenessMsecs
+	for w, samples := range windows {
 		for i := range samples {
 			s := &samples[i]
 			outputKey := getOutputKey(s.key)
@@ -36,13 +49,9 @@ func (as *stdvarAggrState) pushSamples(windows map[int64][]pushSample) {
 			if !ok {
 				// The entry is missing in the map. Try creating it.
 				v = &stdvarStateValue{
-					stdvar: map[int64]*stdvarState{
-						ts: &stdvarState{},
-					},
+					stdvar: make([]*stdvarState, len(windows)),
 				}
-				vNew, loaded := as.m.LoadOrStore(outputKey, v)
-				if loaded {
-					// Use the entry created by a concurrent goroutine.
+				if vNew, loaded := as.m.LoadOrStore(outputKey, v); loaded {
 					v = vNew
 				}
 			}
@@ -51,14 +60,15 @@ func (as *stdvarAggrState) pushSamples(windows map[int64][]pushSample) {
 			deleted := sv.deleted
 			if !deleted {
 				// See `Rapid calculation methods` at https://en.wikipedia.org/wiki/Standard_deviation
-				if _, ok := sv.stdvar[ts]; !ok {
-					sv.stdvar[ts] = &stdvarState{}
+				if sv.stdvar[w] == nil {
+					sv.stdvar[w] = &stdvarState{}
 				}
-				v := sv.stdvar[ts]
+				v := sv.stdvar[w]
 				v.count++
 				avg := v.avg + (s.value-v.avg)/v.count
 				v.q += (s.value - v.avg) * (s.value - avg)
 				v.avg = avg
+				sv.deleteDeadline = deleteDeadline
 			}
 			sv.mu.Unlock()
 			if deleted {
@@ -70,43 +80,27 @@ func (as *stdvarAggrState) pushSamples(windows map[int64][]pushSample) {
 	}
 }
 
-func (as *stdvarAggrState) flushState(ctx *flushCtx, flushTimestamp int64) {
+func (as *stdvarAggrState) flushState(ctx *flushCtx, flushTimestamp int64, w int) {
 	m := &as.m
-	fn := func(states map[int64]*stdvarState) map[int64]*stdvarState {
-		output := make(map[int64]*stdvarState)
-		if flushTimestamp == -1 {
-			for ts, state := range states {
-				output[ts] = state
-				delete(states, ts)
-			}
-		} else if state, ok := states[flushTimestamp]; ok {
-			output[flushTimestamp] = state
-			delete(states, flushTimestamp)
-		}
-		return output
-	}
 	m.Range(func(k, v interface{}) bool {
 		sv := v.(*stdvarStateValue)
 		sv.mu.Lock()
-		states := fn(sv.stdvar)
-		sv.mu.Unlock()
-		for ts, state := range states {
-			stdvar := state.q / state.count
-			sv.mu.Lock()
-			delete(sv.stdvar, ts)
+		deleted := flushTimestamp > sv.deleteDeadline
+		state := sv.stdvar[w]
+		if deleted {
+			// Mark the current entry as deleted
+			sv.deleted = deleted
+		} else if state == nil {
 			sv.mu.Unlock()
-			key := k.(string)
-			ctx.appendSeries(key, "stdvar", ts, stdvar)
+			return true
 		}
-		sv.mu.Lock()
-		if len(sv.stdvar) == 0 {
-			// Mark the entry as deleted, so it won't be updated anymore by concurrent pushSample() calls.
-			sv.deleted = true
-			sv.mu.Unlock()
-			// Atomically delete the entry from the map, so new entry is created for the next flush.
+		sv.stdvar[w] = nil
+		sv.mu.Unlock()
+		stdvar := state.q / state.count
+		key := k.(string)
+		ctx.appendSeries(key, "stdvar", flushTimestamp, stdvar)
+		if deleted {
 			m.Delete(k)
-		} else {
-			sv.mu.Unlock()
 		}
 		return true
 	})

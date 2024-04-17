@@ -20,9 +20,9 @@ func BenchmarkDedupAggr(b *testing.B) {
 
 func BenchmarkDedupAggrFlushSerial(b *testing.B) {
 	as := newTotalAggrState(time.Hour, true, true)
-	flushTimestamp := time.Now().UnixMilli()
-	dedupTimestamp := flushTimestamp
-	benchSamples := newBenchSamples(100_000, flushTimestamp)
+	flushIndex := 0
+	dedupIndex := 0
+	benchSamples := newBenchSamples(100_000, flushIndex)
 	da := newDedupAggr()
 	da.pushSamples(benchSamples)
 
@@ -30,14 +30,14 @@ func BenchmarkDedupAggrFlushSerial(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(int64(len(benchSamples)))
 	for i := 0; i < b.N; i++ {
-		da.flush(as.pushSamples, dedupTimestamp, flushTimestamp)
+		da.flush(as.pushSamples, dedupIndex, flushIndex)
 	}
 }
 
 func benchmarkDedupAggr(b *testing.B, samplesPerPush int) {
 	const loops = 100
-	flushTimestamp := time.Now().UnixMilli()
-	benchSamples := newBenchSamples(samplesPerPush, flushTimestamp)
+	flushIndex := 0
+	benchSamples := newBenchSamples(samplesPerPush, flushIndex)
 	da := newDedupAggr()
 
 	b.ResetTimer()
@@ -52,7 +52,7 @@ func benchmarkDedupAggr(b *testing.B, samplesPerPush int) {
 	})
 }
 
-func newBenchSamples(count int, flushTimestamp int64) map[int64][]pushSample {
+func newBenchSamples(count int, flushIndex int) [][]pushSample {
 	var lc promutils.LabelsCompressor
 	labels := []prompbmarshal.Label{
 		{
@@ -77,11 +77,11 @@ func newBenchSamples(count int, flushTimestamp int64) map[int64][]pushSample {
 		},
 	}
 	labelsLen := len(labels)
-	windows := map[int64][]pushSample{}
-	windows[flushTimestamp] = make([]pushSample, count)
+	windows := [][]pushSample{}
+	windows[flushIndex] = make([]pushSample, count)
 	var keyBuf []byte
-	for i := range windows[flushTimestamp] {
-		sample := &windows[flushTimestamp][i]
+	for i := range windows[flushIndex] {
+		sample := &windows[flushIndex][i]
 		labels = append(labels[:labelsLen], prompbmarshal.Label{
 			Name:  "app",
 			Value: fmt.Sprintf("instance-%d", i),

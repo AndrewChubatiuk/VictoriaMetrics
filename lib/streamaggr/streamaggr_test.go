@@ -883,7 +883,7 @@ func TestAggregatorsWithDedupInterval(t *testing.T) {
 			}
 			tssOutputLock.Unlock()
 		}
-		dedupInterval := 1 * time.Second
+		dedupInterval := 1 * time.Minute
 		opts := &Options{
 			DedupInterval:   dedupInterval,
 			FlushOnShutdown: true,
@@ -920,22 +920,22 @@ func TestAggregatorsWithDedupInterval(t *testing.T) {
 	}
 
 	f(`
-- interval: 2s
+- interval: 1m
   outputs: [sum_samples]
-`, `bar:2s_sum_samples 567
-foo:2s_sum_samples 123
+`, `bar:1m_sum_samples 567
+foo:1m_sum_samples 123
 `, "11", `
 foo 123
 bar 567
 `)
 
 	f(`
-- interval: 2s
+- interval: 1m
   outputs: [sum_samples]
-`, `bar:2s_sum_samples{baz="qwe"} 4.34
-bar:2s_sum_samples{baz="qwer"} 344
-foo:2s_sum_samples 123
-foo:2s_sum_samples{baz="qwe"} 10
+`, `bar:1m_sum_samples{baz="qwe"} 4.34
+bar:1m_sum_samples{baz="qwer"} 344
+foo:1m_sum_samples 123
+foo:1m_sum_samples{baz="qwe"} 10
 `, "11111111", `
 foo 123
 bar{baz="qwe"} 1.32

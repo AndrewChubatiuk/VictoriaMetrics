@@ -2,17 +2,26 @@ package streamaggr
 
 import (
 	"sync"
+	"time"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 )
 
 // lastAggrState calculates output=last, e.g. the last value over input samples.
 type lastAggrState struct {
 	m sync.Map
+
+	// Time series state is dropped if no new samples are received during stalenessMsecs.
+	//
+	// Aslo, the first sample per each new series is ignored during stalenessMsecs even if keepFirstSample is set.
+	stalenessMsecs int64
 }
 
 type lastStateValue struct {
-	mu      sync.Mutex
-	last    map[int64]*lastState
-	deleted bool
+	mu             sync.Mutex
+	last           []*lastState
+	deleted        bool
+	deleteDeadline int64
 }
 
 type lastState struct {
@@ -20,12 +29,17 @@ type lastState struct {
 	timestamp int64
 }
 
-func newLastAggrState() *lastAggrState {
-	return &lastAggrState{}
+func newLastAggrState(stalenessInterval time.Duration) *lastAggrState {
+	stalenessMsecs := durationToMsecs(stalenessInterval)
+	return &lastAggrState{
+		stalenessMsecs: stalenessMsecs,
+	}
 }
 
-func (as *lastAggrState) pushSamples(windows map[int64][]pushSample) {
-	for ts, samples := range windows {
+func (as *lastAggrState) pushSamples(windows [][]pushSample) {
+	currentTime := fasttime.UnixMilli()
+	deleteDeadline := currentTime + as.stalenessMsecs
+	for w, samples := range windows {
 		for i := range samples {
 			s := &samples[i]
 			outputKey := getOutputKey(s.key)
@@ -35,34 +49,24 @@ func (as *lastAggrState) pushSamples(windows map[int64][]pushSample) {
 			if !ok {
 				// The entry is missing in the map. Try creating it.
 				v = &lastStateValue{
-					last: map[int64]*lastState{
-						ts: &lastState{
-							value:     s.value,
-							timestamp: s.timestamp,
-						},
-					},
+					last: make([]*lastState, len(windows)),
 				}
-				vNew, loaded := as.m.LoadOrStore(outputKey, v)
-				if !loaded {
-					// The new entry has been successfully created.
-					continue
+				if vNew, loaded := as.m.LoadOrStore(outputKey, v); loaded {
+					v = vNew
 				}
-				// Use the entry created by a concurrent goroutine.
-				v = vNew
 			}
 			sv := v.(*lastStateValue)
 			sv.mu.Lock()
 			deleted := sv.deleted
 			if !deleted {
-				if last, ok := sv.last[ts]; !ok {
-					sv.last[ts] = &lastState{
-						value:     s.value,
-						timestamp: s.timestamp,
-					}
-				} else if s.timestamp >= last.timestamp {
-					last.value = s.value
-					last.timestamp = s.timestamp
+				if sv.last[w] == nil {
+					sv.last[w] = &lastState{}
 				}
+				if s.timestamp >= sv.last[w].timestamp {
+					sv.last[w].value = s.value
+					sv.last[w].timestamp = s.timestamp
+				}
+				sv.deleteDeadline = deleteDeadline
 			}
 			sv.mu.Unlock()
 			if deleted {
@@ -74,39 +78,26 @@ func (as *lastAggrState) pushSamples(windows map[int64][]pushSample) {
 	}
 }
 
-func (as *lastAggrState) flushState(ctx *flushCtx, flushTimestamp int64) {
+func (as *lastAggrState) flushState(ctx *flushCtx, flushTimestamp int64, w int) {
 	m := &as.m
-	fn := func(states map[int64]*lastState) map[int64]*lastState {
-		output := make(map[int64]*lastState)
-		if flushTimestamp == -1 {
-			for ts, state := range states {
-				output[ts] = state
-				delete(states, ts)
-			}
-		} else if state, ok := states[flushTimestamp]; ok {
-			output[flushTimestamp] = state
-			delete(states, flushTimestamp)
-		}
-		return output
-	}
 	m.Range(func(k, v interface{}) bool {
 		sv := v.(*lastStateValue)
 		sv.mu.Lock()
-		states := fn(sv.last)
-		sv.mu.Unlock()
-		for ts, state := range states {
-			key := k.(string)
-			ctx.appendSeries(key, "last", ts, state.value)
+		deleted := flushTimestamp > sv.deleteDeadline
+		state := sv.last[w]
+		if deleted {
+			// Mark the current entry as deleted
+			sv.deleted = deleted
+		} else if state == nil {
+			sv.mu.Unlock()
+			return true
 		}
-		sv.mu.Lock()
-		if len(sv.last) == 0 {
-			// Mark the entry as deleted, so it won't be updated anymore by concurrent pushSample() calls.
-			sv.deleted = true
-			sv.mu.Unlock()
-			// Atomically delete the entry from the map, so new entry is created for the next flush.
+		sv.last[w] = nil
+		sv.mu.Unlock()
+		key := k.(string)
+		ctx.appendSeries(key, "last", flushTimestamp, state.value)
+		if deleted {
 			m.Delete(k)
-		} else {
-			sv.mu.Unlock()
 		}
 		return true
 	})

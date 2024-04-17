@@ -22,21 +22,24 @@ func TestDeduplicator(t *testing.T) {
 	tss := mustParsePromMetrics(`
 foo{instance="x",job="aaa",pod="sdfd-dfdfdfs",node="aosijjewrerfd",namespace="asdff",container="ohohffd"} 123
 bar{instance="x",job="aaa",pod="sdfd-dfdfdfs",node="aosijjewrerfd",namespace="asdff",container="ohohffd"} 34.54
-x 8943 1000
+x 8943 1
 baz_aaa_aaa_fdd{instance="x",job="aaa",pod="sdfd-dfdfdfs",node="aosijjewrerfd",namespace="asdff",container="ohohffd"} -34.34
-x 90984 900
-x 433 1000
+x 90984
+x 433
 asfjkldsf{instance="x",job="aaa",pod="sdfd-dfdfdfs",node="aosijjewrerfd",namespace="asdff",container="ohohffd"} 12322
 foo{instance="x",job="aaa",pod="sdfd-dfdfdfs",node="aosijjewrerfd",namespace="asdff",container="ohohffd"} 894
 baz_aaa_aaa_fdd{instance="x",job="aaa",pod="sdfd-dfdfdfs",node="aosijjewrerfd",namespace="asdff",container="ohohffd"} -2.3
 `)
 
-	d := NewDeduplicator(pushFunc, interval, []string{"node", "instance"})
+	windowsSize := 4
+	d := NewDeduplicator(pushFunc, interval, []string{"node", "instance"}, windowsSize)
 	for i := 0; i < 10; i++ {
 		d.Push(tss)
 	}
-	flushTimestamp := time.Now().Truncate(interval).Add(interval).UnixMilli()
-	d.flush(pushFunc, interval, flushTimestamp)
+	flushTime := time.Now().Truncate(interval).Add(interval)
+	flushTimestamp := flushTime.UnixMilli()
+	flushIndex := int(flushTimestamp/int64(interval/time.Millisecond)) % windowsSize
+	d.flush(pushFunc, interval, flushIndex)
 	d.MustStop()
 
 	result := timeSeriessToString(tssResult)

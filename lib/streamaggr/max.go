@@ -2,25 +2,39 @@ package streamaggr
 
 import (
 	"sync"
+	"time"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 )
 
 // maxAggrState calculates output=max, e.g. the maximum value over input samples.
 type maxAggrState struct {
 	m sync.Map
+
+	// Time series state is dropped if no new samples are received during stalenessMsecs.
+	//
+	// Aslo, the first sample per each new series is ignored during stalenessMsecs even if keepFirstSample is set.
+	stalenessMsecs int64
 }
 
 type maxStateValue struct {
-	mu      sync.Mutex
-	max     map[int64]float64
-	deleted bool
+	mu             sync.Mutex
+	max            []*float64
+	deleted        bool
+	deleteDeadline int64
 }
 
-func newMaxAggrState() *maxAggrState {
-	return &maxAggrState{}
+func newMaxAggrState(stalenessInterval time.Duration) *maxAggrState {
+	stalenessMsecs := durationToMsecs(stalenessInterval)
+	return &maxAggrState{
+		stalenessMsecs: stalenessMsecs,
+	}
 }
 
-func (as *maxAggrState) pushSamples(windows map[int64][]pushSample) {
-	for ts, samples := range windows {
+func (as *maxAggrState) pushSamples(windows [][]pushSample) {
+	currentTime := fasttime.UnixMilli()
+	deleteDeadline := currentTime + as.stalenessMsecs
+	for w, samples := range windows {
 		for i := range samples {
 			s := &samples[i]
 			outputKey := getOutputKey(s.key)
@@ -30,29 +44,22 @@ func (as *maxAggrState) pushSamples(windows map[int64][]pushSample) {
 			if !ok {
 				// The entry is missing in the map. Try creating it.
 				v = &maxStateValue{
-					max: map[int64]float64{
-						ts: s.value,
-					},
+					max: make([]*float64, len(windows)),
 				}
-				vNew, loaded := as.m.LoadOrStore(outputKey, v)
-				if !loaded {
-					// The new entry has been successfully created.
-					continue
+				if vNew, loaded := as.m.LoadOrStore(outputKey, v); loaded {
+					v = vNew
 				}
-				// Use the entry created by a concurrent goroutine.
-				v = vNew
 			}
 			sv := v.(*maxStateValue)
 			sv.mu.Lock()
 			deleted := sv.deleted
 			if !deleted {
-				if v, ok := sv.max[ts]; ok {
-					if s.value > v {
-						sv.max[ts] = s.value
-					}
-				} else {
-					sv.max[ts] = s.value
+				if sv.max[w] == nil {
+					sv.max[w] = &s.value
+				} else if s.value > *sv.max[w] {
+					sv.max[w] = &s.value
 				}
+				sv.deleteDeadline = deleteDeadline
 			}
 			sv.mu.Unlock()
 			if deleted {
@@ -64,39 +71,26 @@ func (as *maxAggrState) pushSamples(windows map[int64][]pushSample) {
 	}
 }
 
-func (as *maxAggrState) flushState(ctx *flushCtx, flushTimestamp int64) {
+func (as *maxAggrState) flushState(ctx *flushCtx, flushTimestamp int64, w int) {
 	m := &as.m
-	fn := func(states map[int64]float64) map[int64]float64 {
-		output := make(map[int64]float64)
-		if flushTimestamp == -1 {
-			for ts, state := range states {
-				output[ts] = state
-				delete(states, ts)
-			}
-		} else if state, ok := states[flushTimestamp]; ok {
-			output[flushTimestamp] = state
-			delete(states, flushTimestamp)
-		}
-		return output
-	}
 	m.Range(func(k, v interface{}) bool {
 		sv := v.(*maxStateValue)
 		sv.mu.Lock()
-		states := fn(sv.max)
-		sv.mu.Unlock()
-		for ts, state := range states {
-			key := k.(string)
-			ctx.appendSeries(key, "max", ts, state)
+		deleted := flushTimestamp > sv.deleteDeadline
+		state := sv.max[w]
+		if deleted {
+			// Mark the current entry as deleted
+			sv.deleted = deleted
+		} else if state == nil {
+			sv.mu.Unlock()
+			return true
 		}
-		sv.mu.Lock()
-		if len(sv.max) == 0 {
-			// Mark the entry as deleted, so it won't be updated anymore by concurrent pushSample() calls.
-			sv.deleted = true
-			sv.mu.Unlock()
-			// Atomically delete the entry from the map, so new entry is created for the next flush.
+		sv.max[w] = nil
+		sv.mu.Unlock()
+		key := k.(string)
+		ctx.appendSeries(key, "max", flushTimestamp, *state)
+		if deleted {
 			m.Delete(k)
-		} else {
-			sv.mu.Unlock()
 		}
 		return true
 	})
